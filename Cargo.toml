@@ -1,0 +1,19 @@
+[package]
+name = "dirstat-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "UI-free disk-usage engine: parallel scan, directory tree, kind/age classification, extension aggregation, treemap geometry, C ABI."
+repository = "https://github.com/jsnay/dirstat-core"
+rust-version = "1.75"
+
+[lib]
+name = "dirstat_core"
+crate-type = ["rlib", "staticlib", "cdylib"]
+
+[dependencies]
+# Intentionally zero runtime dependencies: keeps the license surface MIT/Apache-only
+# and the engine portable (macOS / Linux / Windows).
+
+[profile.release]
+lto = true
