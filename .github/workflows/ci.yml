@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    strategy:
+      matrix:
+        # The engine MUST build and pass its suite on macOS and Linux
+        # (CORE-STAB-2) — this is what keeps the UI boundary honest.
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo fmt --check
+
+  header:
+    name: Header drift (EVC-FFI-SAFE-3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install cbindgen --locked
+      - name: Generated header matches committed header
+        run: |
+          cbindgen --crate dirstat-core -o /tmp/dirstat_core.h
+          diff -u include/dirstat_core.h /tmp/dirstat_core.h
+
+  staticlib:
+    name: Static library (macOS arm64 + x86_64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      - run: cargo build --release --target aarch64-apple-darwin
+      - run: cargo build --release --target x86_64-apple-darwin
+      - name: Universal lib
+        run: |
+          mkdir -p dist
+          lipo -create \
+            target/aarch64-apple-darwin/release/libdirstat_core.a \
+            target/x86_64-apple-darwin/release/libdirstat_core.a \
+            -output dist/libdirstat_core.a
+          lipo -info dist/libdirstat_core.a
+      - uses: actions/upload-artifact@v4
+        with:
+          name: libdirstat_core-universal
+          path: |
+            dist/libdirstat_core.a
+            include/dirstat_core.h
