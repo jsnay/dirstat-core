@@ -5,9 +5,17 @@ on:
     branches: [main]
   pull_request:
 
+# Least-privilege default: jobs get only read access unless a job opts up.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
+# All third-party actions are pinned to a full commit SHA (with the human
+# tag in a comment) so a compromised or retagged upstream release cannot
+# silently change the build that produces the release artifact
+# (supply-chain hardening, dirstat-core#10).
 jobs:
   test:
     name: Test (${{ matrix.os }})
@@ -18,8 +26,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - run: cargo test --all-targets
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo fmt --check
@@ -28,20 +36,61 @@ jobs:
     name: Header drift (EVC-FFI-SAFE-3)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
       - run: cargo install cbindgen --locked
       - name: Generated header matches committed header
         run: |
           cbindgen --crate dirstat-core -o /tmp/dirstat_core.h
           diff -u include/dirstat_core.h /tmp/dirstat_core.h
 
+  miri:
+    name: Miri (UB check, CORE-STAB-2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: nightly
+          components: miri
+      # Miri runs the pure in-memory logic (tree/classify/treemap/format
+      # unit tests). Filesystem- and thread-heavy integration tests are
+      # excluded — they either need real syscalls Miri does not model or a
+      # scheduler it runs prohibitively slowly — so this validates the
+      # safe-Rust core has no undefined behavior reachable from tests.
+      - run: cargo +nightly miri test --lib
+
+  fuzz:
+    name: Fuzz smoke (hostile input)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      # A fixed-iteration randomized pass over the pure parsers and the
+      # treemap layout with arbitrary bytes / shapes. Not libFuzzer (avoids
+      # the nightly-only toolchain and keeps zero deps); the seeded loop
+      # lives in the `fuzz` integration test and asserts no panic / no UB.
+      - run: cargo test --test fuzz --release
+
+  coverage:
+    name: Coverage (report only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: llvm-tools-preview
+      - run: cargo install cargo-llvm-cov --locked
+      # No gating threshold yet — visibility first. The summary lands in the
+      # job log so coverage gaps stay observable in review.
+      - run: cargo llvm-cov --summary-only
+
   staticlib:
     name: Static library (macOS arm64 + x86_64)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
       - run: cargo build --release --target aarch64-apple-darwin
@@ -54,7 +103,7 @@ jobs:
             target/x86_64-apple-darwin/release/libdirstat_core.a \
             -output dist/libdirstat_core.a
           lipo -info dist/libdirstat_core.a
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
         with:
           name: libdirstat_core-universal
           path: |

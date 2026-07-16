@@ -123,20 +123,47 @@ cargo install cbindgen && cbindgen --crate dirstat-core -o include/dirstat_core.
 ## Building & testing
 
 ```sh
-cargo test                         # full eval suite (30 tests, EVC-* ids)
+cargo test --all-targets           # full suite (EVC-* evals + hardening)
 cargo clippy --all-targets -- -D warnings
 cargo build --release              # target/release/libdirstat_core.a
+
+# Extra suites (also run in CI):
+DIRSTAT_STRESS_FILES=100000 cargo test --test stress   # scale + concurrency
+cargo test --test pathological     # hostile names / depth / degenerate files
+cargo test --test property         # seeded random treemap invariants
+cargo test --test fuzz --release   # fuzz smoke over parsers + layout
+cargo +nightly miri test --lib     # undefined-behavior check on the pure core
 ```
 
-Tests run against **real on-disk temp fixtures** — permissions, symlinks,
-hard links, sparse files, and bind mounts only behave honestly on a real
-filesystem. Environment-dependent tests (bind-mount aliasing, sparse files)
-detect unsupported runners and skip gracefully, so the suite is green on
-plain CI and exercises the real paths where privileges allow.
+Test layout:
 
-CI (`.github/workflows/ci.yml`): tests + clippy + fmt on **Linux and macOS**
-(the multi-OS gate is what keeps the "UI-free" claim honest), a header-drift
-job, and a universal (arm64 + x86_64) macOS static-library artifact.
+- `tests/engine.rs` — the `EVC-*` eval suite (correctness).
+- `tests/ffi.rs` — the C ABI driven exactly as a host would, plus buffer-edge
+  and panic-safety cases.
+- `tests/stress.rs` — a large tree scanned under a fleet of concurrent
+  readers + layout calls + cancel/restart, proving the only-grow /
+  determinism / thread-safety invariants at scale (size via
+  `DIRSTAT_STRESS_FILES`, default 40k).
+- `tests/pathological.rs` — CORE-STAB-1: hostile names (unicode, control
+  chars, 255-byte, invalid UTF-8), symlink cycles, extreme depth, 50k
+  zero-byte files, degenerate `skip_paths`.
+- `tests/property.rs` — seeded random trees checked against the treemap
+  invariants (area∝size, in-bounds, hit-test round-trip, determinism); a
+  failure prints the seed.
+- `tests/fuzz.rs` — dependency-free seeded fuzz over the classifiers and the
+  layout; asserts no panic on arbitrary input.
+
+Everything filesystem-touching runs against **real on-disk temp fixtures** —
+permissions, symlinks, hard links, sparse files, and bind mounts only behave
+honestly on a real filesystem. Environment-dependent tests (bind-mount
+aliasing, sparse files) detect unsupported runners and skip gracefully, so
+the suite is green on plain CI and exercises the real paths where privileges
+allow.
+
+CI (`.github/workflows/ci.yml`, all actions SHA-pinned): tests + clippy + fmt
+on **Linux and macOS**, a header-drift gate, a **Miri** UB check on the pure
+core, a **fuzz** smoke pass, a **coverage** report, and a universal
+(arm64 + x86_64) macOS static-library artifact.
 
 ## Consumers
 
