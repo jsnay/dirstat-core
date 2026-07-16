@@ -109,6 +109,14 @@ pub struct ScanOptions {
     /// a macOS host passes `/System/Volumes/Data` when scanning `/` so the
     /// APFS volume group isn't traversed twice through firmlinks.
     pub skip_paths: Vec<PathBuf>,
+    /// Maximum number of nodes to create (0 = unlimited, the default).
+    /// A safety ceiling against directory-bombs / degenerate trees that
+    /// would otherwise exhaust memory: on reaching it the scan stops
+    /// enqueueing new directories, records a scan-report note, and finishes
+    /// with partial-but-consistent results. In-flight listings may push the
+    /// final count slightly past the ceiling (bounded by one directory's
+    /// width) before they wind down.
+    pub max_nodes: u64,
 }
 
 impl Default for ScanOptions {
@@ -119,6 +127,7 @@ impl Default for ScanOptions {
             include_hidden: true,
             max_concurrency: 0,
             skip_paths: Vec::new(),
+            max_nodes: 0,
         }
     }
 }
@@ -346,6 +355,7 @@ impl Scan {
             progress,
             last_progress_ms: AtomicU64::new(0),
             started: std::time::Instant::now(),
+            node_limit_hit: AtomicBool::new(false),
         });
 
         let workers = (0..n_workers)
@@ -420,6 +430,10 @@ struct ScanShared {
     /// throttle state, CAS-updated so only one worker wins each tick).
     last_progress_ms: AtomicU64,
     started: std::time::Instant,
+    /// Set true (once, via CAS) when the arena reached `options.max_nodes`.
+    /// Latches the ceiling so the report note is pushed exactly once and no
+    /// worker enqueues further directories.
+    node_limit_hit: AtomicBool,
 }
 
 impl ScanShared {
@@ -578,6 +592,13 @@ fn process_dir(sh: &ScanShared, dir_id: NodeId, dir_path: &Path, inherited: Opti
     if sh.cancel.load(Ordering::Relaxed) {
         return; // claimed but cancelled: contribute nothing, stay consistent
     }
+    // Node ceiling latched: skip this already-queued directory entirely so
+    // the scan winds down instead of draining the whole backlog. This bounds
+    // the overshoot past `max_nodes` to the directories already in flight
+    // when the limit hit (at most one per worker), not the queue depth.
+    if sh.node_limit_hit.load(Ordering::Acquire) {
+        return;
+    }
     let entries = match std::fs::read_dir(dir_path) {
         Ok(rd) => rd,
         Err(e) => {
@@ -647,6 +668,12 @@ fn process_dir(sh: &ScanShared, dir_id: NodeId, dir_path: &Path, inherited: Opti
         };
 
         let mut fl = if hidden { flags::HIDDEN } else { 0 };
+        // Non-UTF-8 names are flagged so hosts refuse destructive actions on
+        // them (their lossy string path can collide with a different file).
+        // `to_str` is None exactly when the raw OS bytes are not valid UTF-8.
+        if name.to_str().is_none() {
+            fl |= flags::NON_UTF8;
+        }
 
         if meta.is_dir() {
             if !sh.options.cross_filesystems && device_of(&meta) != sh.root_dev {
@@ -744,6 +771,7 @@ fn process_dir(sh: &ScanShared, dir_id: NodeId, dir_path: &Path, inherited: Opti
     let mut d_files = 0u64;
     let mut d_subdirs = 0u64;
     let mut subdir_jobs: Vec<(NodeId, PathBuf, Option<Category>)> = Vec::new();
+    let node_count;
 
     {
         let mut tree = sh.model.tree.write().unwrap();
@@ -785,6 +813,28 @@ fn process_dir(sh: &ScanShared, dir_id: NodeId, dir_path: &Path, inherited: Opti
         if let Some(n) = tree.get_mut(dir_id) {
             n.flags &= !flags::SCANNING;
         }
+        node_count = tree.len() as u64;
+    }
+
+    // Node ceiling (CORE-STAB: directory-bomb defense). Once the arena
+    // reaches the limit, stop enqueueing new directories; in-flight workers
+    // finish their current listings (so the final count may sit one
+    // directory-width past the ceiling) and the queue drains normally. The
+    // report note is pushed exactly once via the CAS latch.
+    if sh.options.max_nodes != 0
+        && node_count >= sh.options.max_nodes
+        && sh
+            .node_limit_hit
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    {
+        sh.model.errors.lock().unwrap().push(ScanError {
+            path: dir_path.to_path_buf(),
+            message: format!(
+                "node limit {} reached; results are partial",
+                sh.options.max_nodes
+            ),
+        });
     }
 
     // Extension aggregation, incremental (CORE-EXT-1). Done outside the
@@ -810,8 +860,9 @@ fn process_dir(sh: &ScanShared, dir_id: NodeId, dir_path: &Path, inherited: Opti
 
     // Publish new work last, and only if there is any: notify_all (not
     // notify_one) because several parked workers can be put to use when a
-    // wide directory yields many subdirectories at once.
-    if !subdir_jobs.is_empty() {
+    // wide directory yields many subdirectories at once. Suppressed once the
+    // node ceiling latched, so the scan winds down instead of growing.
+    if !subdir_jobs.is_empty() && !sh.node_limit_hit.load(Ordering::Acquire) {
         let mut q = sh.queue.queue.lock().unwrap();
         q.items.extend(subdir_jobs);
         drop(q);
@@ -982,30 +1033,48 @@ pub fn refresh_node(model: &Arc<Model>, id: NodeId) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Copy a scanned subtree from `src` (rooted at `src_id`) under `dst_id`,
-/// depth-first. Aggregates are copied as-is (the sub-scan already computed
-/// them); only `ext_id` is dropped because the interning tables of the two
-/// models don't correspond.
+/// Copy a scanned subtree from `src` (rooted at `src_id`) under `dst_id`.
+/// Aggregates are copied as-is (the sub-scan already computed them); only
+/// `ext_id` is dropped because the interning tables of the two models don't
+/// correspond.
+///
+/// ITERATIVE by design (security, dirstat-core#6): a recursive walk here
+/// used one stack frame per directory level, so a maliciously deep tree
+/// (trivially created with nested mkdir) could overflow the stack when a
+/// host runs Re-scan From Here on it — and a stack overflow *aborts* the
+/// process, bypassing the FFI `catch_unwind` guard. An explicit work stack
+/// bounds memory to the heap instead. Order differs from the old
+/// depth-first recursion (it now processes a directory's whole child list
+/// before descending), but the resulting tree is identical. This is the
+/// only place in the crate that walks unbounded tree depth without an
+/// explicit stack or depth cap; keep it that way.
 fn graft(dst: &mut Tree, dst_id: NodeId, src: &Tree, src_id: NodeId) {
-    let src_node = src.get(src_id).unwrap();
-    let children: Vec<NodeId> = src_node.children.clone();
-    for cid in children {
-        let c = src.get(cid).unwrap();
-        let new_id = dst.push(Node {
-            name: c.name.clone(),
-            parent: dst_id,
-            children: Vec::new(),
-            kind: c.kind,
-            logical: c.logical,
-            physical: c.physical,
-            files: c.files,
-            subdirs: c.subdirs,
-            mtime: c.mtime,
-            flags: c.flags,
-            category: c.category,
-            ext_id: u32::MAX, // ext stats are not re-aggregated on refresh (documented)
-        });
-        graft(dst, new_id, src, cid);
+    // Each work item pairs a source node with the destination parent its
+    // children should be attached under.
+    let mut stack: Vec<(NodeId, NodeId)> = vec![(src_id, dst_id)];
+    while let Some((src_parent, dst_parent)) = stack.pop() {
+        let children: Vec<NodeId> = src.get(src_parent).unwrap().children.clone();
+        for cid in children {
+            let c = src.get(cid).unwrap();
+            let new_id = dst.push(Node {
+                name: c.name.clone(),
+                parent: dst_parent,
+                children: Vec::new(),
+                kind: c.kind,
+                logical: c.logical,
+                physical: c.physical,
+                files: c.files,
+                subdirs: c.subdirs,
+                mtime: c.mtime,
+                flags: c.flags,
+                ext_id: u32::MAX, // ext stats not re-aggregated on refresh (documented)
+                category: c.category,
+            });
+            // Descend only into directories; leaves have no children to copy.
+            if c.is_dir() {
+                stack.push((cid, new_id));
+            }
+        }
     }
 }
 

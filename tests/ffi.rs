@@ -251,3 +251,156 @@ fn evc_ffi_error_paths() {
     ds_model_free(model);
     ds_model_free(std::ptr::null_mut()); // no-op, no crash
 }
+
+// ---------------------------------------------------------------------------
+// FFI buffer edges + ABI v4 raw path (dirstat-core#9, #5).
+// ---------------------------------------------------------------------------
+
+/// ds_node_children with cap < total fills cap and returns total; cap == 0
+/// and NULL buf just count.
+#[test]
+fn ffi_children_buffer_edges() {
+    let fx = Fixture::new("kids");
+    for i in 0..10 {
+        fx.file(&format!("f{i}.bin"), 100 + i);
+    }
+    let root_c = CString::new(fx.root.to_str().unwrap()).unwrap();
+    let scan = ds_scan_begin(
+        root_c.as_ptr(),
+        std::ptr::null(),
+        None,
+        std::ptr::null_mut(),
+    );
+    ds_scan_join(scan);
+    let model = ds_scan_model(scan);
+    ds_scan_free(scan);
+    let root = ds_model_root(model);
+
+    // NULL buf, cap 0: count only.
+    assert_eq!(
+        ds_node_children(model, root, 0, 1, std::ptr::null_mut(), 0),
+        10
+    );
+    // Too-small buffer: fills 3, still returns the true total of 10.
+    let mut small = [0u64; 3];
+    assert_eq!(
+        ds_node_children(model, root, 0, 1, small.as_mut_ptr(), 3),
+        10
+    );
+    assert!(small.iter().all(|&x| x != 0), "the 3 slots were filled");
+    ds_model_free(model);
+}
+
+/// Two-call string pattern at exact boundaries: cap == needed, cap ==
+/// needed-1 (truncated but NUL-terminated), cap == 1 (just the NUL).
+#[test]
+fn ffi_string_boundaries() {
+    let fx = Fixture::new("strbound");
+    fx.file("exactly_sixteen!.x", 1); // name length chosen to be nontrivial
+    let root_c = CString::new(fx.root.to_str().unwrap()).unwrap();
+    let scan = ds_scan_begin(
+        root_c.as_ptr(),
+        std::ptr::null(),
+        None,
+        std::ptr::null_mut(),
+    );
+    ds_scan_join(scan);
+    let model = ds_scan_model(scan);
+    ds_scan_free(scan);
+    let root = ds_model_root(model);
+    let mut kids = [0u64; 4];
+    ds_node_children(model, root, 0, 1, kids.as_mut_ptr(), 4);
+    let child = kids[0];
+
+    let needed = ds_node_name(model, child, std::ptr::null_mut(), 0);
+    assert!(needed > 1);
+    // cap == needed: full name + NUL.
+    let mut buf = vec![0u8; needed as usize];
+    ds_node_name(model, child, buf.as_mut_ptr() as *mut c_char, buf.len());
+    assert_eq!(*buf.last().unwrap(), 0);
+    // cap == 1: only the NUL fits (empty string, no overflow).
+    let mut one = [0xAAu8; 1];
+    ds_node_name(model, child, one.as_mut_ptr() as *mut c_char, 1);
+    assert_eq!(one[0], 0);
+    ds_model_free(model);
+}
+
+/// treemap layout on a zero-byte / empty model returns an empty buffer, not
+/// an error, and handles a 0-area rect.
+#[test]
+fn ffi_layout_degenerate() {
+    let fx = Fixture::new("emptylayout");
+    fx.file("z", 0); // single zero-byte file: root total is 0
+    let root_c = CString::new(fx.root.to_str().unwrap()).unwrap();
+    let scan = ds_scan_begin(
+        root_c.as_ptr(),
+        std::ptr::null(),
+        None,
+        std::ptr::null_mut(),
+    );
+    ds_scan_join(scan);
+    let model = ds_scan_model(scan);
+    ds_scan_free(scan);
+    let root = ds_model_root(model);
+
+    let mut rects: *mut DsTmRect = std::ptr::null_mut();
+    let mut len = 999usize;
+    // Zero total bytes: empty layout, len set to 0, still returns success.
+    assert_eq!(
+        ds_treemap_layout(model, root, 400.0, 300.0, 1, 2.0, 0, &mut rects, &mut len),
+        0
+    );
+    assert_eq!(len, 0);
+    ds_treemap_free(rects, len);
+    // 0-width rect: also empty, no panic.
+    let mut r2: *mut DsTmRect = std::ptr::null_mut();
+    let mut l2 = 0usize;
+    assert_eq!(
+        ds_treemap_layout(model, root, 0.0, 300.0, 1, 2.0, 0, &mut r2, &mut l2),
+        0
+    );
+    assert_eq!(l2, 0);
+    ds_treemap_free(r2, l2);
+    ds_model_free(model);
+}
+
+/// ds_node_path_raw returns the exact bytes (two-call by byte length) and,
+/// for a non-UTF-8 name, differs from the lossy string path.
+#[cfg(unix)]
+#[test]
+fn ffi_node_path_raw() {
+    use std::os::unix::ffi::OsStrExt;
+    let fx = Fixture::new("rawffi");
+    let bad = std::ffi::OsStr::from_bytes(b"r\xffw.bin");
+    if std::fs::write(fx.root.join(bad), vec![0u8; 3]).is_err() {
+        eprintln!("skipping: filesystem rejects non-UTF-8 names (e.g. macOS)");
+        return;
+    }
+    let root_c = CString::new(fx.root.to_str().unwrap()).unwrap();
+    let scan = ds_scan_begin(
+        root_c.as_ptr(),
+        std::ptr::null(),
+        None,
+        std::ptr::null_mut(),
+    );
+    ds_scan_join(scan);
+    let model = ds_scan_model(scan);
+    ds_scan_free(scan);
+    let root = ds_model_root(model);
+    let mut kids = [0u64; 2];
+    ds_node_children(model, root, 0, 1, kids.as_mut_ptr(), 2);
+    let child = kids[0];
+
+    // Flag is set.
+    let mut info = unsafe { std::mem::zeroed::<DsNodeInfo>() };
+    ds_node_info(model, child, &mut info);
+    assert_ne!(info.flags & DS_NODE_FLAG_NON_UTF8, 0);
+
+    // Raw path: two-call by byte length; contains the raw 0xFF.
+    let needed = ds_node_path_raw(model, child, std::ptr::null_mut(), 0);
+    assert!(needed > 0);
+    let mut raw = vec![0u8; needed as usize];
+    ds_node_path_raw(model, child, raw.as_mut_ptr(), raw.len());
+    assert!(raw.contains(&0xff), "raw path preserves the invalid byte");
+    ds_model_free(model);
+}

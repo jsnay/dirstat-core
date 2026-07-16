@@ -114,7 +114,10 @@ use crate::treemap::{self, Algorithm, LayoutParams, LayoutRect};
 /// v3: `ds_treemap_layout` gained a `metric` parameter (0 logical,
 /// 1 physical); `ds_node_children` accepts sort key 4 (physical);
 /// `DsCategoryStat` gained `physical`.
-pub const DS_ABI_VERSION: u32 = 3;
+/// v4: `DsScanOptions` gained `max_nodes`; `DS_NODE_FLAG_NON_UTF8` added;
+/// `ds_node_path_raw` added (raw-bytes path for names the lossy string
+/// path can't safely represent).
+pub const DS_ABI_VERSION: u32 = 4;
 
 thread_local! {
     // Per-thread last-error text (empty = no error). Thread-local so
@@ -207,6 +210,19 @@ pub struct DsModel {
     model: Arc<Model>,
 }
 
+/// Raw OS bytes of a path, without lossy UTF-8 conversion. On Unix this is
+/// the exact byte sequence the kernel uses; elsewhere no non-UTF-8 paths
+/// occur in practice, so the lossy UTF-8 bytes are an adequate fallback.
+#[cfg(unix)]
+fn os_path_bytes(path: &std::path::Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    path.as_os_str().as_bytes().to_vec()
+}
+#[cfg(not(unix))]
+fn os_path_bytes(path: &std::path::Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
+}
+
 /// The host's progress callback plus its user_data pointer, boxed at a
 /// stable address so worker threads can reach it via raw pointer.
 struct CallbackState {
@@ -236,6 +252,11 @@ pub const DS_NODE_FLAG_SCANNING: u32 = 8;
 /// Directory alias (same device+inode already scanned via another path,
 /// e.g. an APFS firmlink): listed but contributes nothing.
 pub const DS_NODE_FLAG_DUPLICATE: u32 = 16;
+/// The node's name is not valid UTF-8, so the lossy string path
+/// (`ds_node_path`) can collide with a different real file. Hosts MUST
+/// refuse to trash/delete via the string path when this bit is set; use
+/// `ds_node_path_raw` or skip the node.
+pub const DS_NODE_FLAG_NON_UTF8: u32 = 32;
 
 #[cfg(test)]
 mod flag_sync {
@@ -248,6 +269,7 @@ mod flag_sync {
         assert_eq!(super::DS_NODE_FLAG_UNREADABLE, flags::UNREADABLE);
         assert_eq!(super::DS_NODE_FLAG_SCANNING, flags::SCANNING);
         assert_eq!(super::DS_NODE_FLAG_DUPLICATE, flags::DUPLICATE);
+        assert_eq!(super::DS_NODE_FLAG_NON_UTF8, flags::NON_UTF8);
     }
 }
 
@@ -271,6 +293,11 @@ pub struct DsScanOptions {
     /// when `skip_paths_len` is 0. Only read during `ds_scan_begin`.
     pub skip_paths: *const *const c_char,
     pub skip_paths_len: usize,
+    /// Maximum nodes to create (0 = unlimited). A safety ceiling against
+    /// directory-bombs: on reaching it the scan stops enqueueing, records a
+    /// scan-report note, and finishes partial-but-consistent. Interactive
+    /// hosts should pass a generous value (e.g. 50_000_000).
+    pub max_nodes: u64,
 }
 
 /// Flat per-node facts (CORE-FFI-4). Strings via `ds_node_name`/`ds_node_path`.
@@ -468,6 +495,7 @@ pub extern "C" fn ds_scan_begin(
             include_hidden: opts.map(|o| o.exclude_hidden == 0).unwrap_or(true),
             max_concurrency: opts.map(|o| o.max_concurrency as usize).unwrap_or(0),
             skip_paths,
+            max_nodes: opts.map(|o| o.max_nodes).unwrap_or(0),
         };
 
         // Progress-callback trampoline: adapt the engine's Rust closure
@@ -740,6 +768,40 @@ pub extern "C" fn ds_node_path(
             return -1;
         }
         fill_str(&tree.abs_path(NodeId(id)).to_string_lossy(), buf, cap)
+    })
+}
+
+/// Absolute path of a node as RAW OS bytes (no lossy conversion, no NUL).
+/// This is the safe path to feed back to the OS for nodes whose name is not
+/// valid UTF-8 (`DS_NODE_FLAG_NON_UTF8`), where `ds_node_path`'s lossy
+/// string could denote a different file. Two-call pattern by BYTE length:
+/// pass `cap == 0` to learn the byte count, then a buffer of that size.
+/// Returns the total byte length (NOT NUL-terminated), negative on error.
+#[no_mangle]
+pub extern "C" fn ds_node_path_raw(
+    model: *const DsModel,
+    id: u64,
+    buf: *mut u8,
+    cap: usize,
+) -> i64 {
+    guard(-1, || {
+        let Some(m) = (unsafe { model.as_ref() }) else {
+            set_error("NULL model");
+            return -1;
+        };
+        let tree = m.model.tree.read().unwrap();
+        if tree.get(NodeId(id)).is_none() {
+            set_error(format!("invalid node id {id}"));
+            return -1;
+        }
+        let path = tree.abs_path(NodeId(id));
+        let bytes = os_path_bytes(&path);
+        if !buf.is_null() && cap > 0 {
+            let n = bytes.len().min(cap);
+            // SAFETY: caller guarantees `buf` points to at least `cap` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf, n) };
+        }
+        bytes.len() as i64
     })
 }
 

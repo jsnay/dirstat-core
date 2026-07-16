@@ -701,3 +701,205 @@ fn alias_directory_counted_once() {
         .count();
     assert_eq!(dups, 1);
 }
+
+// ---------------------------------------------------------------------------
+// ABI v4: non-UTF-8 name flag, node ceiling (dirstat-core#5, #11).
+// ---------------------------------------------------------------------------
+
+/// A file whose name is not valid UTF-8 is flagged NON_UTF8, and its lossy
+/// string path differs from the raw bytes — the confused-deputy hazard the
+/// flag exists to let hosts refuse. Only Linux-family filesystems permit
+/// arbitrary bytes in names; macOS (APFS/HFS+) rejects invalid UTF-8 at
+/// creation (EILSEQ), so the test skips gracefully there.
+#[cfg(unix)]
+#[test]
+fn non_utf8_name_is_flagged() {
+    use std::os::unix::ffi::OsStrExt;
+    let fx = Fixture::new("nonutf8");
+    fx.file("ok.txt", 10);
+    // 0xFF is never valid UTF-8; build a name from raw bytes.
+    let bad = std::ffi::OsStr::from_bytes(b"bad\xff\xfename.bin");
+    if fs::write(fx.root.join(bad), vec![0u8; 20]).is_err() {
+        eprintln!("skipping: filesystem rejects non-UTF-8 names (e.g. macOS)");
+        return;
+    }
+
+    let s = scan(&fx.root);
+    let tree = s.model.tree.read().unwrap();
+    let mut found = false;
+    for i in 0..tree.len() {
+        let id = NodeId::from_index(i);
+        let n = tree.get(id).unwrap();
+        if n.flags & dirstat_core::tree::flags::NON_UTF8 != 0 {
+            found = true;
+            // Lossy string path replaces the invalid bytes; the raw path does not.
+            let lossy = tree.abs_path(id).to_string_lossy().into_owned();
+            assert!(lossy.contains('\u{FFFD}'), "lossy path should carry U+FFFD");
+        } else {
+            assert!(
+                n.name.to_string_lossy().chars().all(|c| c != '\u{FFFD}'),
+                "valid names must not be flagged non-UTF-8"
+            );
+        }
+    }
+    assert!(found, "the non-UTF-8 file must be flagged");
+}
+
+/// A validly-named file whose name literally contains U+FFFD is NOT flagged
+/// (it is valid UTF-8), so the flag can't be spoofed to bypass host guards.
+#[test]
+fn literal_replacement_char_is_not_flagged() {
+    let fx = Fixture::new("ufffd");
+    fx.file("real\u{FFFD}name.bin", 10);
+    let s = scan(&fx.root);
+    let tree = s.model.tree.read().unwrap();
+    for i in 0..tree.len() {
+        assert_eq!(
+            tree.get(NodeId::from_index(i)).unwrap().flags & dirstat_core::tree::flags::NON_UTF8,
+            0
+        );
+    }
+}
+
+/// max_nodes stops the scan at (approximately) the ceiling, leaves a
+/// partial-but-consistent tree, and records the report note exactly once.
+#[test]
+fn node_ceiling_bounds_the_scan() {
+    let fx = Fixture::new("ceiling");
+    for i in 0..2_000 {
+        fx.file(&format!("d{}/f{}.dat", i % 40, i), 64);
+    }
+    let mut s = Scan::begin(
+        &fx.root,
+        ScanOptions {
+            max_nodes: 200,
+            ..ScanOptions::default()
+        },
+        None,
+    )
+    .unwrap();
+    s.join();
+    let tree = s.model.tree.read().unwrap();
+    // Stopped near the ceiling (in-flight listings may overshoot by up to
+    // one directory's width, well under the 2040 total).
+    assert!(tree.len() >= 200, "reached the ceiling");
+    assert!(tree.len() < 1_500, "stopped well short of the full tree");
+    // Invariant holds on the partial tree.
+    for i in 0..tree.len() {
+        let n = tree.get(NodeId::from_index(i)).unwrap();
+        assert_eq!(n.items(), n.files + n.subdirs);
+    }
+    // The report note is present exactly once.
+    let errors = s.model.errors.lock().unwrap();
+    let notes = errors
+        .iter()
+        .filter(|e| e.message.contains("node limit"))
+        .count();
+    assert_eq!(notes, 1);
+}
+
+// ---------------------------------------------------------------------------
+// refresh_node: deep tree (iterative graft) + edge cases (dirstat-core#6, #9).
+// ---------------------------------------------------------------------------
+
+/// A deep chain refreshes correctly (validates the iterative graft rewrite,
+/// dirstat-core#6). Depth is capped by PATH_MAX: the scanner joins absolute
+/// paths per level, so the filesystem limits real depth to ~2000 short
+/// levels on Linux; the iterative graft removes depth-proportional stack use
+/// as robustness regardless of that ceiling.
+#[test]
+fn refresh_deep_chain() {
+    let fx = Fixture::new("deep");
+    // ~800-char path, safely under macOS PATH_MAX (1024) as well as Linux's.
+    const DEPTH: usize = 400;
+    let mut rel = String::new();
+    for _ in 0..DEPTH {
+        rel.push_str("d/");
+    }
+    rel.push_str("leaf.bin");
+    fx.file(&rel, 4_096);
+    let s = scan(&fx.root);
+    let chain_root = find(&s, &["d"]);
+    assert_eq!(
+        s.model
+            .tree
+            .read()
+            .unwrap()
+            .get(NodeId::ROOT)
+            .unwrap()
+            .logical,
+        4_096
+    );
+    // Delete the leaf, then refresh the whole chain from its top.
+    let mut deep_leaf = fx.root.clone();
+    for _ in 0..DEPTH {
+        deep_leaf.push("d");
+    }
+    deep_leaf.push("leaf.bin");
+    fs::remove_file(&deep_leaf).unwrap();
+    refresh_node(&s.model, chain_root).unwrap(); // iterative graft: no abort
+    let tree = s.model.tree.read().unwrap();
+    assert_eq!(tree.get(NodeId::ROOT).unwrap().logical, 0);
+}
+
+/// Refreshing the root itself is valid and reconciles (edge: parent is INVALID).
+#[test]
+fn refresh_root() {
+    let fx = Fixture::new("refroot");
+    fx.file("a.bin", 10_000).file("sub/b.bin", 5_000);
+    let s = scan(&fx.root);
+    fs::remove_file(fx.root.join("a.bin")).unwrap();
+    refresh_node(&s.model, NodeId::ROOT).unwrap();
+    let tree = s.model.tree.read().unwrap();
+    assert_eq!(tree.get(NodeId::ROOT).unwrap().logical, 5_000);
+}
+
+/// A path that changed KIND between scans (file -> directory) refreshes
+/// correctly rather than corrupting aggregates.
+#[test]
+fn refresh_file_became_directory() {
+    let fx = Fixture::new("kindswap");
+    fx.file("thing", 8_000).file("keep.bin", 1_000);
+    let s = scan(&fx.root);
+    let thing = find(&s, &["thing"]);
+    // Replace the file with a directory containing a bigger file.
+    fs::remove_file(fx.root.join("thing")).unwrap();
+    fs::create_dir(fx.root.join("thing")).unwrap();
+    fs::write(fx.root.join("thing/inner.bin"), vec![0u8; 20_000]).unwrap();
+    refresh_node(&s.model, thing).unwrap();
+    let tree = s.model.tree.read().unwrap();
+    // root = keep(1000) + thing subtree(20000)
+    assert_eq!(tree.get(NodeId::ROOT).unwrap().logical, 21_000);
+    for i in 0..tree.len() {
+        let n = tree.get(NodeId::from_index(i)).unwrap();
+        assert_eq!(n.items(), n.files + n.subdirs);
+    }
+}
+
+/// ds_node_path_raw round-trips the exact bytes for a normal name (checked
+/// here at the Rust level; the FFI harness checks the C surface).
+#[cfg(unix)]
+#[test]
+fn abs_path_bytes_are_raw() {
+    use std::os::unix::ffi::OsStrExt;
+    let fx = Fixture::new("rawpath");
+    let bad = std::ffi::OsStr::from_bytes(b"x\xffy.bin");
+    if fs::write(fx.root.join(bad), vec![0u8; 5]).is_err() {
+        eprintln!("skipping: filesystem rejects non-UTF-8 names (e.g. macOS)");
+        return;
+    }
+    let s = scan(&fx.root);
+    let tree = s.model.tree.read().unwrap();
+    // Find the bad node and confirm its raw abs_path bytes contain 0xFF
+    // (lossy conversion would have replaced it).
+    let mut ok = false;
+    for i in 0..tree.len() {
+        let id = NodeId::from_index(i);
+        if tree.get(id).unwrap().flags & dirstat_core::tree::flags::NON_UTF8 != 0 {
+            let p = tree.abs_path(id);
+            assert!(p.as_os_str().as_bytes().contains(&0xff));
+            ok = true;
+        }
+    }
+    assert!(ok);
+}

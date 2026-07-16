@@ -15,5 +15,4 @@ deferrals are explicit). Nothing here blocks the design-review scope
 | CORE-EXT-1 (partial) | Physical bytes per extension | Logical bytes drive the legend/table in the design; physical per-type adds a second aggregation pass nothing displays yet. |
 | CORE-SCAN-12 (partial) | `refresh_node` does not re-aggregate extension stats for the refreshed subtree | Post-delete refresh keeps tree totals exact; type-table drift after deletes is bounded and vanishes on rescan. Fix lands with save/reload phase. |
 | CORE-PERF-1/2, CORE-MEM-1 | Recorded perf baselines (`perf-baseline.json`) | Needs a stable reference machine; budgets are machine-relative by spec. |
-| CORE-STAB-2 (partial) | `cargo miri` job | Not yet in CI; test suite + clippy gate is in place. |
 | CORE-SCAN-1 (partial) | ctime + `getattrlistbulk` fast path | mtime ships (age channel needs it); ctime and the macOS bulk-stat syscall are perf work, not correctness. |
