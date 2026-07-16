@@ -1,4 +1,38 @@
-//! Engine evals (spec §13). Fixtures are built as on-disk temp trees.
+//! ============================================================================
+//! FILE: tests/engine.rs
+//!
+//! ============================================================================
+//!
+//! # Purpose
+//! The engine eval suite (spec §13): every `EVC-*` id from the spec's
+//! coverage table that applies to the Rust-native API is proven here.
+//! Tests run against REAL on-disk temp trees rather than mocks, because the
+//! contract under test is "facts about a filesystem" — permissions,
+//! symlinks, hard links, sparse files, and mount aliasing only behave
+//! honestly on a real filesystem.
+//!
+//! # Upstream dependencies (what this file consumes)
+//! - dirstat_core::scan — Scan lifecycle, refresh_node, ScanOptions
+//! - dirstat_core::tree — NodeId/SortKey and direct Model.tree reads
+//! - dirstat_core::treemap — layout/hit_test/LayoutParams/Algorithm
+//! - std::fs / std::os::unix — fixture construction (files, symlinks,
+//!   hard links, permission bits, sparse files, bind mounts)
+//!
+//! # Structure
+//! - Fixture — a self-cleaning temp directory builder; `file(rel, size)`
+//!   creates parents and writes `size` zero bytes
+//! - scan()/find() — helpers: run a scan to completion; resolve a path of
+//!   component names to a NodeId
+//! - one #[test] per EVC id (names carry the id), plus regression tests for
+//!   field-reported bugs (progressive reads, alias dedup, sparse metric)
+//!
+//! # Notes for reviewers
+//! - Privileged-environment tests (bind-mount aliasing) and
+//!   filesystem-dependent tests (sparse files) detect unsupported
+//!   environments and return early rather than fail, so the suite is green
+//!   on ordinary CI runners AND exercises the real path where possible.
+//! - Fixture names embed the process id so parallel test binaries can't
+//!   collide in the shared temp dir.
 
 use std::fs;
 use std::path::{Path, PathBuf};

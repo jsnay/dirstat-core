@@ -1,6 +1,30 @@
-//! EVC-FFI-1 / EVC-FFI-SAFE-1: drive the C ABI end-to-end from the "host"
-//! side — init → scan → navigate → layout → hit-test → refresh → free —
-//! and prove panics never unwind across the boundary.
+//! ============================================================================
+//! FILE: tests/ffi.rs
+//!
+//! ============================================================================
+//!
+//! # Purpose
+//! EVC-FFI-1 / EVC-FFI-SAFE-1: drive the C ABI exactly as a host would —
+//! init → scan → navigate → layout → hit-test → refresh → free — and prove
+//! panics never unwind across the boundary. This file plays the role of
+//! the Swift app: it calls only the exported `ds_*` functions (never the
+//! internal Rust API) so a green run here means the header's contract
+//! actually works, including the two-call string pattern, bulk-buffer
+//! ownership, and NULL/bad-id error paths.
+//!
+//! # Upstream dependencies (what this file consumes)
+//! - dirstat_core::ffi — the entire exported surface under test
+//! - std::ffi::CString / raw pointers — to fake the C caller faithfully
+//! - std::fs — the same on-disk Fixture strategy as tests/engine.rs
+//!
+//! # Structure
+//! - Fixture — self-cleaning temp tree builder (duplicated from
+//!   tests/engine.rs; integration tests cannot share private helpers)
+//! - c_string_from — exercises the size-then-fill two-call pattern the way
+//!   a C caller would (measure with NULL, allocate, fill)
+//! - evc_ffi_end_to_end — the full lifecycle walk with value assertions
+//! - evc_ffi_panic_safe — the deliberate-panic hook returns -1 + message
+//! - evc_ffi_error_paths — NULL/invalid inputs report errors, never crash
 
 use std::ffi::{c_char, CString};
 use std::fs;
