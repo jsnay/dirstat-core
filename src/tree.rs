@@ -133,6 +133,14 @@ pub mod flags {
     /// contributes nothing and is not descended, so aliased trees are
     /// counted exactly once.
     pub const DUPLICATE: u32 = 1 << 4;
+    /// The node's name is not valid UTF-8. `Tree::abs_path` /
+    /// `Node.name.to_string_lossy()` are LOSSY for such names (invalid
+    /// bytes become U+FFFD), so the string path can collide with a
+    /// different real file. Hosts MUST refuse to mutate the filesystem
+    /// (trash/delete) via the lossy path when this bit is set — use the
+    /// raw-bytes path accessor, or skip the node. (Security: prevents a
+    /// confused-deputy deletion via crafted non-UTF-8 names.)
+    pub const NON_UTF8: u32 = 1 << 5;
 }
 
 /// One node in the arena.

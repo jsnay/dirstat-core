@@ -16,7 +16,10 @@
 // v3: `ds_treemap_layout` gained a `metric` parameter (0 logical,
 // 1 physical); `ds_node_children` accepts sort key 4 (physical);
 // `DsCategoryStat` gained `physical`.
-#define DS_ABI_VERSION 3
+// v4: `DsScanOptions` gained `max_nodes`; `DS_NODE_FLAG_NON_UTF8` added;
+// `ds_node_path_raw` added (raw-bytes path for names the lossy string
+// path can't safely represent).
+#define DS_ABI_VERSION 4
 
 // Node flag bits mirrored into the C header (values asserted equal to the
 // internal `tree::flags` constants by a unit test).
@@ -31,6 +34,12 @@
 // Directory alias (same device+inode already scanned via another path,
 // e.g. an APFS firmlink): listed but contributes nothing.
 #define DS_NODE_FLAG_DUPLICATE 16
+
+// The node's name is not valid UTF-8, so the lossy string path
+// (`ds_node_path`) can collide with a different real file. Hosts MUST
+// refuse to trash/delete via the string path when this bit is set; use
+// `ds_node_path_raw` or skip the node.
+#define DS_NODE_FLAG_NON_UTF8 32
 
 // Opaque handle to a scanned model. Holds an `Arc<Model>`, so any number
 // of handles may exist and the model lives until the last one is freed —
@@ -60,6 +69,11 @@ typedef struct DsScanOptions {
   // when `skip_paths_len` is 0. Only read during `ds_scan_begin`.
   const char *const *skip_paths;
   size_t skip_paths_len;
+  // Maximum nodes to create (0 = unlimited). A safety ceiling against
+  // directory-bombs: on reaching it the scan stops enqueueing, records a
+  // scan-report note, and finishes partial-but-consistent. Interactive
+  // hosts should pass a generous value (e.g. 50_000_000).
+  uint64_t max_nodes;
 } DsScanOptions;
 
 // Live scan totals for progress polling. Cheap to read at any time
@@ -243,6 +257,14 @@ int32_t ds_node_name(const struct DsModel *model, uint64_t id, char *buf, size_t
 
 // Absolute filesystem path of a node. Two-call pattern.
 int32_t ds_node_path(const struct DsModel *model, uint64_t id, char *buf, size_t cap);
+
+// Absolute path of a node as RAW OS bytes (no lossy conversion, no NUL).
+// This is the safe path to feed back to the OS for nodes whose name is not
+// valid UTF-8 (`DS_NODE_FLAG_NON_UTF8`), where `ds_node_path`'s lossy
+// string could denote a different file. Two-call pattern by BYTE length:
+// pass `cap == 0` to learn the byte count, then a buffer of that size.
+// Returns the total byte length (NOT NUL-terminated), negative on error.
+int64_t ds_node_path_raw(const struct DsModel *model, uint64_t id, uint8_t *buf, size_t cap);
 
 // Sorted children (CORE-TREE-3). `sort`: 0 size, 1 name, 2 items,
 // 3 mtime, 4 physical size; nonzero `descending` reverses. Fills up to
