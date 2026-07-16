@@ -13,7 +13,10 @@
 // mismatched header/library pair (CORE-FFI-SAFE-3 / APP-FFI-6).
 // v2: `DsScanOptions` gained `skip_paths`/`skip_paths_len`;
 // `DS_NODE_FLAG_DUPLICATE` added.
-#define DS_ABI_VERSION 2
+// v3: `ds_treemap_layout` gained a `metric` parameter (0 logical,
+// 1 physical); `ds_node_children` accepts sort key 4 (physical);
+// `DsCategoryStat` gained `physical`.
+#define DS_ABI_VERSION 3
 
 // Node flag bits mirrored into the C header (values asserted equal to the
 // internal `tree::flags` constants by a unit test).
@@ -91,7 +94,10 @@ typedef struct DsTypeStat {
 // Per-category aggregate for the legend chips / capacity footer (1b).
 typedef struct DsCategoryStat {
   uint8_t category;
+  // Apparent bytes.
   uint64_t logical;
+  // Allocated on-disk bytes (what the capacity footer should show).
+  uint64_t physical;
   uint64_t files;
 } DsCategoryStat;
 
@@ -212,14 +218,18 @@ int32_t ds_model_volume(const struct DsModel *model, struct DsVolumeInfo *out);
 int32_t ds_model_error(const struct DsModel *model, uint64_t index, char *buf, size_t cap);
 
 // Lay out the subtree under `root` into a `w × h` rectangle at origin.
-// `algorithm`: 0 KDirStat rows, 1 squarified. On success writes an
-// engine-owned buffer to `(out, out_len)`; free with `ds_treemap_free`.
+// `algorithm`: 0 KDirStat rows, 1 squarified. `metric`: 0 = area ∝
+// logical (apparent) bytes, 1 = area ∝ physical (allocated) bytes — the
+// truthful channel when sparse files, APFS clones, or cloud-placeholder
+// (dataless) files are present. On success writes an engine-owned buffer
+// to `(out, out_len)`; free with `ds_treemap_free`.
 int32_t ds_treemap_layout(const struct DsModel *model,
                           uint64_t root,
                           float w,
                           float h,
                           uint8_t algorithm,
                           float min_px,
+                          uint8_t metric,
                           struct DsTmRect **out,
                           size_t *out_len);
 

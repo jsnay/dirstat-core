@@ -100,7 +100,10 @@ impl Node {
 }
 
 /// Child sort keys (CORE-TREE-3). Sorting is within one parent only and uses
-/// name as the stable secondary key.
+/// name as the stable secondary key. `Size` is logical (apparent) bytes;
+/// `PhysicalSize` is allocated on-disk bytes — the truthful metric on
+/// filesystems with sparse files, clones, and cloud-placeholder (dataless)
+/// files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SortKey {
@@ -108,6 +111,7 @@ pub enum SortKey {
     Name = 1,
     Items = 2,
     Mtime = 3,
+    PhysicalSize = 4,
 }
 
 impl SortKey {
@@ -116,6 +120,7 @@ impl SortKey {
             1 => SortKey::Name,
             2 => SortKey::Items,
             3 => SortKey::Mtime,
+            4 => SortKey::PhysicalSize,
             _ => SortKey::Size,
         }
     }
@@ -233,6 +238,7 @@ impl Tree {
                 SortKey::Name => na.name.cmp(&nb.name),
                 SortKey::Items => na.items().cmp(&nb.items()),
                 SortKey::Mtime => na.mtime.cmp(&nb.mtime),
+                SortKey::PhysicalSize => na.physical.cmp(&nb.physical),
             };
             let ord = if descending { ord.reverse() } else { ord };
             ord.then_with(|| na.name.cmp(&nb.name))

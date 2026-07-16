@@ -329,6 +329,7 @@ fn evc_treemap_area() {
                 algorithm: algo,
                 min_px: 0.5,
                 max_depth: 32,
+                use_physical: false,
             },
             &|_| 12,
             &|_| 0,
@@ -540,6 +541,64 @@ fn evc_limit_saturating() {
     });
     tree.propagate(NodeId::ROOT, 100, 0, 1, 0);
     assert_eq!(tree.get(NodeId::ROOT).unwrap().logical, u64::MAX);
+}
+
+/// Physical metric: sparse files (the stand-in for cloud-placeholder /
+/// dataless files) dominate logically but not physically; the physical
+/// sort key and physical-area layout must reflect on-disk truth.
+#[cfg(unix)]
+#[test]
+fn physical_metric_ignores_sparse_bloat() {
+    let fx = Fixture::new("sparse");
+    fx.file("real.bin", 100_000);
+    // A 10 MB apparent file with (almost) no allocated blocks.
+    let sparse_path = fx.root.join("sparse.bin");
+    let f = fs::File::create(&sparse_path).unwrap();
+    f.set_len(10_000_000).unwrap();
+    drop(f);
+    let physical = fs::symlink_metadata(&sparse_path)
+        .map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            m.blocks() * 512
+        })
+        .unwrap();
+    if physical >= 1_000_000 {
+        eprintln!("skipping: filesystem does not create sparse files");
+        return;
+    }
+    let s = scan(&fx.root);
+    let tree = s.model.tree.read().unwrap();
+
+    // Logical sort puts the sparse file first; physical sort puts it last.
+    let by_logical = tree.sorted_children(NodeId::ROOT, SortKey::Size, true);
+    let by_physical = tree.sorted_children(NodeId::ROOT, SortKey::PhysicalSize, true);
+    let name = |id: NodeId| tree.get(id).unwrap().name.to_string_lossy().into_owned();
+    assert_eq!(name(by_logical[0]), "sparse.bin");
+    assert_eq!(name(by_physical[0]), "real.bin");
+
+    // Physical-area layout gives the real file the dominant rect.
+    let rects = treemap::layout(
+        &tree,
+        NodeId::ROOT,
+        0.0,
+        0.0,
+        1000.0,
+        600.0,
+        LayoutParams {
+            use_physical: true,
+            ..LayoutParams::default()
+        },
+        &|_| 12,
+        &|_| 0,
+    );
+    let area = |target: &str| -> f64 {
+        rects
+            .iter()
+            .find(|r| name(r.node) == target)
+            .map(|r| r.w as f64 * r.h as f64)
+            .unwrap_or(0.0)
+    };
+    assert!(area("real.bin") > area("sparse.bin") * 5.0);
 }
 
 /// skip_paths: host-supplied directories are not descended (the macOS
