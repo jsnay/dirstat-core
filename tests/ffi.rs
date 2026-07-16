@@ -155,7 +155,7 @@ fn evc_ffi_end_to_end() {
     let mut rects: *mut DsTmRect = std::ptr::null_mut();
     let mut len: usize = 0;
     assert_eq!(
-        ds_treemap_layout(model, root, 900.0, 500.0, 1, 1.0, &mut rects, &mut len),
+        ds_treemap_layout(model, root, 900.0, 500.0, 1, 1.0, 0, &mut rects, &mut len),
         0
     );
     assert!(len >= 5, "root + 2 dirs + 3 files, got {len}");

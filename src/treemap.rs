@@ -55,6 +55,9 @@ pub struct LayoutParams {
     pub min_px: f32,
     /// Maximum recursion depth (safety valve for pathological trees).
     pub max_depth: u16,
+    /// Area ∝ physical (allocated) bytes instead of logical bytes — the
+    /// truthful channel on filesystems with sparse/clone/dataless files.
+    pub use_physical: bool,
 }
 
 impl Default for LayoutParams {
@@ -63,6 +66,7 @@ impl Default for LayoutParams {
             algorithm: Algorithm::Squarified,
             min_px: 2.0,
             max_depth: 64,
+            use_physical: false,
         }
     }
 }
@@ -100,7 +104,12 @@ pub fn layout(
     let Some(n) = tree.get(root) else {
         return ctx.out;
     };
-    if n.logical == 0 || w <= 0.0 || h <= 0.0 {
+    let root_size = if params.use_physical {
+        n.physical
+    } else {
+        n.logical
+    };
+    if root_size == 0 || w <= 0.0 || h <= 0.0 {
         return ctx.out;
     }
     emit(&mut ctx, root, x, y, w, h, 0);
@@ -132,10 +141,22 @@ fn emit(ctx: &mut Ctx, id: NodeId, x: f32, y: f32, w: f32, h: f32, depth: u16) {
 
     // Children sorted size-desc; zero-size children are invisible by
     // definition (area ∝ size, CORE-TM-1).
+    let use_physical = ctx.params.use_physical;
     let mut kids: Vec<(NodeId, u64)> = n
         .children
         .iter()
-        .filter_map(|&c| ctx.tree.get(c).map(|cn| (c, cn.logical)))
+        .filter_map(|&c| {
+            ctx.tree.get(c).map(|cn| {
+                (
+                    c,
+                    if use_physical {
+                        cn.physical
+                    } else {
+                        cn.logical
+                    },
+                )
+            })
+        })
         .filter(|&(_, s)| s > 0)
         .collect();
     if kids.is_empty() {

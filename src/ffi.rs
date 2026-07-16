@@ -37,7 +37,10 @@ use crate::treemap::{self, Algorithm, LayoutParams, LayoutRect};
 /// mismatched header/library pair (CORE-FFI-SAFE-3 / APP-FFI-6).
 /// v2: `DsScanOptions` gained `skip_paths`/`skip_paths_len`;
 /// `DS_NODE_FLAG_DUPLICATE` added.
-pub const DS_ABI_VERSION: u32 = 2;
+/// v3: `ds_treemap_layout` gained a `metric` parameter (0 logical,
+/// 1 physical); `ds_node_children` accepts sort key 4 (physical);
+/// `DsCategoryStat` gained `physical`.
+pub const DS_ABI_VERSION: u32 = 3;
 
 thread_local! {
     static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
@@ -202,7 +205,10 @@ pub struct DsTypeStat {
 #[derive(Clone, Copy)]
 pub struct DsCategoryStat {
     pub category: u8,
+    /// Apparent bytes.
     pub logical: u64,
+    /// Allocated on-disk bytes (what the capacity footer should show).
+    pub physical: u64,
     pub files: u64,
 }
 
@@ -643,24 +649,26 @@ pub extern "C" fn ds_category_list(
             return -1;
         };
         let tree = m.model.tree.read().unwrap();
-        let mut agg = [(0u64, 0u64); CATEGORY_COUNT];
+        let mut agg = [(0u64, 0u64, 0u64); CATEGORY_COUNT];
         for i in 0..tree.len() {
             let n = tree.get(NodeId::from_index(i)).unwrap();
             if !n.is_dir() && n.flags & crate::tree::flags::HARDLINK_DUP == 0 {
                 let c = (n.category as usize).min(CATEGORY_COUNT - 1);
                 agg[c].0 += n.logical;
-                agg[c].1 += 1;
+                agg[c].1 += n.physical;
+                agg[c].2 += 1;
             }
         }
         let mut order: Vec<usize> = (0..CATEGORY_COUNT).collect();
-        order.sort_by(|&a, &b| agg[b].0.cmp(&agg[a].0).then(a.cmp(&b)));
+        order.sort_by(|&a, &b| agg[b].1.cmp(&agg[a].1).then(a.cmp(&b)));
         if !buf.is_null() {
             for (i, &c) in order.iter().take(cap).enumerate() {
                 unsafe {
                     *buf.add(i) = DsCategoryStat {
                         category: c as u8,
                         logical: agg[c].0,
-                        files: agg[c].1,
+                        physical: agg[c].1,
+                        files: agg[c].2,
                     };
                 }
             }
@@ -748,8 +756,11 @@ pub extern "C" fn ds_model_error(
 // ---------------------------------------------------------------------------
 
 /// Lay out the subtree under `root` into a `w × h` rectangle at origin.
-/// `algorithm`: 0 KDirStat rows, 1 squarified. On success writes an
-/// engine-owned buffer to `(out, out_len)`; free with `ds_treemap_free`.
+/// `algorithm`: 0 KDirStat rows, 1 squarified. `metric`: 0 = area ∝
+/// logical (apparent) bytes, 1 = area ∝ physical (allocated) bytes — the
+/// truthful channel when sparse files, APFS clones, or cloud-placeholder
+/// (dataless) files are present. On success writes an engine-owned buffer
+/// to `(out, out_len)`; free with `ds_treemap_free`.
 #[no_mangle]
 pub extern "C" fn ds_treemap_layout(
     model: *const DsModel,
@@ -758,6 +769,7 @@ pub extern "C" fn ds_treemap_layout(
     h: f32,
     algorithm: u8,
     min_px: f32,
+    metric: u8,
     out: *mut *mut DsTmRect,
     out_len: *mut usize,
 ) -> i32 {
@@ -784,6 +796,7 @@ pub extern "C" fn ds_treemap_layout(
                 algorithm: Algorithm::from_u8(algorithm),
                 min_px: if min_px > 0.0 { min_px } else { 2.0 },
                 max_depth: 64,
+                use_physical: metric == 1,
             },
             &|ext_id| {
                 if ext_id == u32::MAX {
