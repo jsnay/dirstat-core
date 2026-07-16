@@ -372,7 +372,10 @@ fn ffi_node_path_raw() {
     use std::os::unix::ffi::OsStrExt;
     let fx = Fixture::new("rawffi");
     let bad = std::ffi::OsStr::from_bytes(b"r\xffw.bin");
-    std::fs::write(fx.root.join(bad), vec![0u8; 3]).unwrap();
+    if std::fs::write(fx.root.join(bad), vec![0u8; 3]).is_err() {
+        eprintln!("skipping: filesystem rejects non-UTF-8 names (e.g. macOS)");
+        return;
+    }
     let root_c = CString::new(fx.root.to_str().unwrap()).unwrap();
     let scan = ds_scan_begin(
         root_c.as_ptr(),

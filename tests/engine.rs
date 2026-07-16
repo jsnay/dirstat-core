@@ -708,8 +708,9 @@ fn alias_directory_counted_once() {
 
 /// A file whose name is not valid UTF-8 is flagged NON_UTF8, and its lossy
 /// string path differs from the raw bytes — the confused-deputy hazard the
-/// flag exists to let hosts refuse. Unix-only (only Unix allows arbitrary
-/// non-UTF-8 names via OsStrExt::from_bytes).
+/// flag exists to let hosts refuse. Only Linux-family filesystems permit
+/// arbitrary bytes in names; macOS (APFS/HFS+) rejects invalid UTF-8 at
+/// creation (EILSEQ), so the test skips gracefully there.
 #[cfg(unix)]
 #[test]
 fn non_utf8_name_is_flagged() {
@@ -718,7 +719,10 @@ fn non_utf8_name_is_flagged() {
     fx.file("ok.txt", 10);
     // 0xFF is never valid UTF-8; build a name from raw bytes.
     let bad = std::ffi::OsStr::from_bytes(b"bad\xff\xfename.bin");
-    fs::write(fx.root.join(bad), vec![0u8; 20]).unwrap();
+    if fs::write(fx.root.join(bad), vec![0u8; 20]).is_err() {
+        eprintln!("skipping: filesystem rejects non-UTF-8 names (e.g. macOS)");
+        return;
+    }
 
     let s = scan(&fx.root);
     let tree = s.model.tree.read().unwrap();
@@ -806,7 +810,8 @@ fn node_ceiling_bounds_the_scan() {
 #[test]
 fn refresh_deep_chain() {
     let fx = Fixture::new("deep");
-    const DEPTH: usize = 1_200; // ~2400-char path, safely under PATH_MAX
+    // ~800-char path, safely under macOS PATH_MAX (1024) as well as Linux's.
+    const DEPTH: usize = 400;
     let mut rel = String::new();
     for _ in 0..DEPTH {
         rel.push_str("d/");
@@ -879,7 +884,10 @@ fn abs_path_bytes_are_raw() {
     use std::os::unix::ffi::OsStrExt;
     let fx = Fixture::new("rawpath");
     let bad = std::ffi::OsStr::from_bytes(b"x\xffy.bin");
-    fs::write(fx.root.join(bad), vec![0u8; 5]).unwrap();
+    if fs::write(fx.root.join(bad), vec![0u8; 5]).is_err() {
+        eprintln!("skipping: filesystem rejects non-UTF-8 names (e.g. macOS)");
+        return;
+    }
     let s = scan(&fx.root);
     let tree = s.model.tree.read().unwrap();
     // Find the bad node and confirm its raw abs_path bytes contain 0xFF

@@ -128,7 +128,10 @@ fn invalid_utf8_name() {
     use std::os::unix::ffi::OsStrExt;
     let fx = Fx::new("badutf8");
     let bad = std::ffi::OsStr::from_bytes(b"\xff\xfe\x80raw.bin");
-    fs::write(fx.root.join(bad), vec![0u8; 7]).unwrap();
+    if fs::write(fx.root.join(bad), vec![0u8; 7]).is_err() {
+        eprintln!("skipping: filesystem rejects non-UTF-8 names (e.g. macOS)");
+        return;
+    }
     let s = scan(&fx.root);
     assert_consistent(&s);
     let tree = s.model.tree.read().unwrap();
