@@ -44,7 +44,7 @@ fn c_string_from(f: impl Fn(*mut c_char, usize) -> i32) -> String {
 
 #[test]
 fn evc_ffi_end_to_end() {
-    assert_eq!(ds_abi_version(), 1);
+    assert_eq!(ds_abi_version(), DS_ABI_VERSION);
 
     let fx = Fixture::new("e2e");
     fx.file("movies/clip.mov", 80_000)

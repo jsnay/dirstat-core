@@ -11,7 +11,9 @@
 
 // Bump on every ABI change; the Swift wrapper refuses to run against a
 // mismatched header/library pair (CORE-FFI-SAFE-3 / APP-FFI-6).
-#define DS_ABI_VERSION 1
+// v2: `DsScanOptions` gained `skip_paths`/`skip_paths_len`;
+// `DS_NODE_FLAG_DUPLICATE` added.
+#define DS_ABI_VERSION 2
 
 // Node flag bits mirrored into the C header (values asserted equal to the
 // internal `tree::flags` constants by a unit test).
@@ -23,6 +25,10 @@
 
 #define DS_NODE_FLAG_SCANNING 8
 
+// Directory alias (same device+inode already scanned via another path,
+// e.g. an APFS firmlink): listed but contributes nothing.
+#define DS_NODE_FLAG_DUPLICATE 16
+
 typedef struct DsModel DsModel;
 
 typedef struct DsScan DsScan;
@@ -33,6 +39,13 @@ typedef struct DsScanOptions {
   uint8_t follow_symlinks;
   uint8_t exclude_hidden;
   uint32_t max_concurrency;
+  // Optional array of `skip_paths_len` NUL-terminated UTF-8 absolute
+  // directory paths the scan must not descend into (platform knowledge
+  // the host supplies — e.g. `/System/Volumes/Data` when scanning `/` on
+  // macOS so the APFS volume group is not traversed twice). May be NULL
+  // when `skip_paths_len` is 0. Only read during `ds_scan_begin`.
+  const char *const *skip_paths;
+  size_t skip_paths_len;
 } DsScanOptions;
 
 // Live scan totals for progress polling.

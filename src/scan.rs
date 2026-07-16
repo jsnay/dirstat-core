@@ -28,6 +28,11 @@ pub struct ScanOptions {
     pub include_hidden: bool,
     /// Worker threads; 0 = available parallelism (CORE-OPT-7).
     pub max_concurrency: usize,
+    /// Absolute directory paths the scan must not descend into (default
+    /// empty). "Which paths" is platform knowledge the host supplies — e.g.
+    /// a macOS host passes `/System/Volumes/Data` when scanning `/` so the
+    /// APFS volume group isn't traversed twice through firmlinks.
+    pub skip_paths: Vec<PathBuf>,
 }
 
 impl Default for ScanOptions {
@@ -37,6 +42,7 @@ impl Default for ScanOptions {
             follow_symlinks: false,
             include_hidden: true,
             max_concurrency: 0,
+            skip_paths: Vec::new(),
         }
     }
 }
@@ -198,6 +204,11 @@ impl Scan {
             },
             ext_index: Mutex::new(HashMap::new()),
             inodes: Mutex::new(HashMap::new()),
+            dir_inodes: Mutex::new({
+                let mut seen = std::collections::HashSet::new();
+                seen.insert((root_dev, inode_of(&meta)));
+                seen
+            }),
             options,
             root_dev,
             cancel: Arc::clone(&cancel),
@@ -250,6 +261,10 @@ struct ScanShared {
     queue: WorkQueue,
     ext_index: Mutex<HashMap<String, u32>>,
     inodes: Mutex<HashMap<(u64, u64), ()>>,
+    /// Directories already scanned, by (device, inode): the second path to
+    /// an aliased directory (APFS firmlink, bind mount) becomes a
+    /// zero-contribution `DUPLICATE` node instead of a double count.
+    dir_inodes: Mutex<std::collections::HashSet<(u64, u64)>>,
     options: ScanOptions,
     root_dev: u64,
     cancel: Arc<AtomicBool>,
@@ -389,6 +404,9 @@ fn process_dir(sh: &ScanShared, dir_id: NodeId, dir_path: &Path, inherited: Opti
         ext_id: u32,
         subdir_inherit: Option<Category>,
         is_subdir: bool,
+        /// False for alias duplicates: counted as a subdir entry but never
+        /// enqueued for listing.
+        descend: bool,
     }
     let mut found: Vec<Entry> = Vec::new();
 
@@ -423,6 +441,14 @@ fn process_dir(sh: &ScanShared, dir_id: NodeId, dir_path: &Path, inherited: Opti
             if !sh.options.cross_filesystems && device_of(&meta) != sh.root_dev {
                 continue; // CORE-SCAN-7: don't cross mounts
             }
+            if !sh.options.skip_paths.is_empty() && sh.options.skip_paths.iter().any(|s| s == &path)
+            {
+                continue; // host-supplied skip list (platform knowledge)
+            }
+            // Alias dedup: a directory inode already scanned via another
+            // path (APFS firmlink, bind mount) must not be counted twice.
+            let dir_key = (device_of(&meta), inode_of(&meta));
+            let is_alias = !sh.dir_inodes.lock().unwrap().insert(dir_key);
             let dir_cat = classify::category_for_dir_name(&name_str);
             let child_inherit = dir_cat.or(inherited);
             found.push(Entry {
@@ -431,11 +457,16 @@ fn process_dir(sh: &ScanShared, dir_id: NodeId, dir_path: &Path, inherited: Opti
                 logical: 0,
                 physical: 0,
                 mtime: mtime_of(&meta),
-                flags: fl | flags::SCANNING,
+                flags: if is_alias {
+                    fl | flags::DUPLICATE
+                } else {
+                    fl | flags::SCANNING
+                },
                 category: child_inherit.unwrap_or(Category::Other),
                 ext_id: u32::MAX,
                 subdir_inherit: child_inherit,
                 is_subdir: true,
+                descend: !is_alias,
             });
         } else {
             let is_symlink = meta.file_type().is_symlink();
@@ -473,6 +504,7 @@ fn process_dir(sh: &ScanShared, dir_id: NodeId, dir_path: &Path, inherited: Opti
                 ext_id,
                 subdir_inherit: None,
                 is_subdir: false,
+                descend: false,
             });
         }
     }
@@ -505,7 +537,9 @@ fn process_dir(sh: &ScanShared, dir_id: NodeId, dir_path: &Path, inherited: Opti
             });
             if e.is_subdir {
                 d_subdirs += 1;
-                subdir_jobs.push((id, dir_path.join(&e.name), e.subdir_inherit));
+                if e.descend {
+                    subdir_jobs.push((id, dir_path.join(&e.name), e.subdir_inherit));
+                }
             } else {
                 d_files += 1;
                 d_logical += e.logical;
