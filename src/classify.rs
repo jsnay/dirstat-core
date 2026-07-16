@@ -1,11 +1,55 @@
-//! Kind classification: the ~8 stable, learnable categories that replace
-//! WinDirStat's "top 12 extensions this scan" coloring (design 1g).
+//! ============================================================================
+//! FILE: src/classify.rs
 //!
-//! The engine owns *which category a node belongs to* (a fact about the
-//! data, derived from a curated extension + path-rule table). The host owns
-//! the RGB each category gets. Hosts on platforms with richer type systems
-//! (macOS UTIs) can refine the table later; the built-in rules are portable
-//! and deterministic.
+//! ============================================================================
+//!
+//! # Purpose
+//! Kind classification: the 8 stable, learnable categories that replace
+//! WinDirStat's "top 12 extensions this scan" coloring (design 1g). The
+//! engine owns *which category a node belongs to* (a fact about the data,
+//! derived from a curated extension + path-rule table); the host owns the
+//! RGB each category gets. The key design decision is the two-tier rule
+//! system: directory-name path rules set an inherited category for whole
+//! subtrees ("where it lives"), and only files with no inherited category
+//! fall back to their own extension ("what it is") — which is what makes a
+//! `.mov` inside `Caches` count as System junk rather than Media. Rules are
+//! portable and deterministic; hosts with richer type systems (macOS UTIs)
+//! can refine later.
+//!
+//! # Upstream dependencies (what this file consumes)
+//! - (none — pure functions over strings; no std facilities beyond core
+//!   string ops, no other crate modules)
+//!
+//! # Downstream consumers (who depends on this file)
+//! - src/scan.rs — calls `category_for_dir_name` on every directory as it
+//!   descends (threading the result down as the inherited category) and
+//!   `classify_file` on every file at insert time; stores `Category as u8`
+//!   in `Node.category`
+//! - src/ffi.rs — `Category::from_u8`/`name` behind `ds_category_name`;
+//!   `CATEGORY_COUNT` sizes the `ds_category_list` aggregation
+//! - src/lib.rs — re-exports `Category`
+//! - tests/engine.rs — asserts path-rule propagation end-to-end
+//!
+//! # Structure
+//! - `Category` / `CATEGORY_COUNT` — the stable 8-bucket id space (ABI)
+//! - `Category::from_u8` / `Category::name` — decode + stable English label
+//! - `category_for_dir_name` — path-segment rules for directories/bundles
+//! - `category_for_extension` — the curated extension table for files
+//! - `classify_file` — the precedence rule: inherited (path) beats extension
+//! - tests — precedence and bundle-classification unit checks
+//!
+//! # Algorithm & invariants
+//! - Precedence: path rule (nearest ancestor with a match, deeper wins)
+//!   over file extension over `Other`. Enforced by `classify_file` taking
+//!   `inherited` first, and by scan.rs overriding the inherited value with
+//!   `dir_cat.or(inherited)` as it descends.
+//! - Category ids are ABI-frozen (they cross FFI in `DsNodeInfo.category`
+//!   and index the host palette): never renumber, only append.
+//! - All matching is deterministic and case-handled explicitly: exact
+//!   (case-sensitive) names for real-world artifacts like `DerivedData`,
+//!   lowercased comparisons everywhere else.
+//!
+//! ============================================================================
 
 /// Stable category ids. The numeric values are ABI: they cross the FFI
 /// boundary in `DsNodeInfo.category` and index the host's palette.
@@ -30,9 +74,14 @@ pub enum Category {
     Other = 7,
 }
 
+/// Number of categories; sizes fixed-length aggregation arrays (e.g. the
+/// `ds_category_list` output, which always returns exactly this many rows).
 pub const CATEGORY_COUNT: usize = 8;
 
 impl Category {
+    /// Decode a raw category byte (e.g. from FFI or `Node.category`).
+    /// Unknown values collapse to `Other` rather than erroring, keeping
+    /// old hosts forward-compatible with engines that add categories.
     pub fn from_u8(v: u8) -> Category {
         match v {
             0 => Category::Developer,
@@ -65,6 +114,9 @@ impl Category {
 /// descends. A match sets the "inherited" category for everything below
 /// (unless a deeper rule overrides). This is how DerivedData is "Developer"
 /// and Caches is "System" regardless of the extensions inside.
+///
+/// Returns `None` for directories with no rule, which means "keep whatever
+/// category was inherited from above" (see the `.or` chaining in scan.rs).
 pub fn category_for_dir_name(name: &str) -> Option<Category> {
     // Case-sensitive where the real-world artifact is (macOS conventions),
     // otherwise lowercase comparisons.
@@ -92,7 +144,8 @@ pub fn category_for_dir_name(name: &str) -> Option<Category> {
     }
     let lower = name.to_ascii_lowercase();
     // Bundle-style directory extensions classify the whole bundle
-    // ("classified as one thing" — design 1g).
+    // ("classified as one thing" — design 1g): a .photoslibrary is Photos
+    // all the way down even though its guts are sqlite and plists.
     if let Some(ext) = lower.rsplit_once('.').map(|(_, e)| e) {
         return match ext {
             "app" | "appex" | "xpc" | "framework" | "dylib" => Some(Category::Apps),
@@ -109,7 +162,9 @@ pub fn category_for_dir_name(name: &str) -> Option<Category> {
     None
 }
 
-/// Extension → category for plain files. Lowercase input expected.
+/// Extension → category for plain files. Lowercase input expected (the
+/// scanner lowercases in `extension_of`, giving the case-insensitive merge
+/// the spec requires). Unknown extensions map to `Other`.
 pub fn category_for_extension(ext: &str) -> Category {
     match ext {
         // Developer
@@ -164,6 +219,9 @@ pub fn classify_file(ext: Option<&str>, inherited: Option<Category>) -> Category
 mod tests {
     use super::*;
 
+    /// The precedence contract of `classify_file`: an inherited path-rule
+    /// category always wins; extension only applies when nothing is
+    /// inherited.
     #[test]
     fn path_rules_beat_extensions() {
         assert_eq!(
@@ -177,6 +235,8 @@ mod tests {
         assert_eq!(classify_file(Some("mov"), None), Category::Media);
     }
 
+    /// Bundle-style directory names classify the whole subtree (design 1g);
+    /// plain names with no rule ("Documents") classify nothing.
     #[test]
     fn bundles_classify_as_one_thing() {
         assert_eq!(

@@ -32,15 +32,26 @@
 // e.g. an APFS firmlink): listed but contributes nothing.
 #define DS_NODE_FLAG_DUPLICATE 16
 
+// Opaque handle to a scanned model. Holds an `Arc<Model>`, so any number
+// of handles may exist and the model lives until the last one is freed —
+// independent of the scan handle's lifetime.
 typedef struct DsModel DsModel;
 
+// Opaque handle to a running (or finished) scan. Created by
+// `ds_scan_begin`; destroyed by `ds_scan_free` (which cancels and joins
+// if the scan is still running).
 typedef struct DsScan DsScan;
 
 // Scan options; zero-initialize for defaults.
 typedef struct DsScanOptions {
+  // Nonzero: cross filesystem/mount boundaries (default 0, stay on one).
   uint8_t cross_filesystems;
+  // Nonzero: follow symlinks (default 0, count the link itself).
   uint8_t follow_symlinks;
+  // Nonzero: skip dotfiles (default 0, include them). Note the polarity:
+  // the C-side field is exclude_*, the engine default is include.
   uint8_t exclude_hidden;
+  // Worker threads; 0 = automatic (available parallelism, capped).
   uint32_t max_concurrency;
   // Optional array of `skip_paths_len` NUL-terminated UTF-8 absolute
   // directory paths the scan must not descend into (platform knowledge
@@ -51,25 +62,42 @@ typedef struct DsScanOptions {
   size_t skip_paths_len;
 } DsScanOptions;
 
-// Live scan totals for progress polling.
+// Live scan totals for progress polling. Cheap to read at any time
+// (lock-free counters); safe while the scan is running.
 typedef struct DsScanStats {
+  // Nodes discovered so far (monotonic).
   uint64_t items;
+  // Logical bytes counted so far (monotonic).
   uint64_t bytes;
+  // Nonzero once the scan has finished (complete or cancelled).
   uint8_t complete;
+  // Scan-report entries so far; retrieve via `ds_model_error`.
   uint64_t error_count;
 } DsScanStats;
 
 // Flat per-node facts (CORE-FFI-4). Strings via `ds_node_name`/`ds_node_path`.
+// For directories, sizes/counts are subtree aggregates (descendants only);
+// for files they are the file's own figures.
 typedef struct DsNodeInfo {
+  // The node's own id (echoed back for convenience).
   uint64_t id;
+  // Parent node id; 0 for the root.
   uint64_t parent;
+  // Logical (apparent) bytes.
   uint64_t logical;
+  // Physical (allocated on-disk) bytes.
   uint64_t physical;
+  // Files in subtree (a file counts itself as 1).
   uint64_t files;
+  // Directories in subtree (excluding self).
   uint64_t subdirs;
+  // files + subdirs (the engine maintains this invariant).
   uint64_t items;
+  // mtime, seconds since Unix epoch; 0 when unknown.
   int64_t mtime;
+  // Number of direct children (size the ds_node_children buffer).
   uint32_t child_count;
+  // Bitset of DS_NODE_FLAG_* values.
   uint32_t flags;
   // 0 file, 1 dir, 2 symlink.
   uint8_t kind;
@@ -85,7 +113,9 @@ typedef struct DsNodeInfo {
 typedef struct DsTypeStat {
   // Lowercased extension, NUL-terminated, truncated to fit.
   char ext[16];
+  // Total logical bytes across files with this extension.
   uint64_t logical;
+  // Number of files with this extension.
   uint64_t files;
   // 0..11 distinct palette slot, 12 = aggregated "other".
   uint8_t slot;
@@ -93,33 +123,48 @@ typedef struct DsTypeStat {
 
 // Per-category aggregate for the legend chips / capacity footer (1b).
 typedef struct DsCategoryStat {
+  // Category id; label via `ds_category_name`.
   uint8_t category;
   // Apparent bytes.
   uint64_t logical;
   // Allocated on-disk bytes (what the capacity footer should show).
   uint64_t physical;
+  // Number of files in this category (hard-link duplicates excluded).
   uint64_t files;
 } DsCategoryStat;
 
-// Volume reconciliation figures (CORE-SYN-2/3).
+// Volume reconciliation figures (CORE-SYN-2/3). `total`/`free` echo what
+// the host supplied via `ds_model_set_volume`; the engine owns only the
+// `unknown` math.
 typedef struct DsVolumeInfo {
+  // Volume capacity in bytes (host-supplied).
   uint64_t total;
+  // Free bytes (host-supplied).
   uint64_t free;
   // `max(0, total - free - measured)` — the "unreadable" number.
   uint64_t unknown;
 } DsVolumeInfo;
 
-// One treemap rectangle (bulk buffer element).
+// One treemap rectangle (bulk buffer element). Directory rects precede
+// their children in the buffer, so painting in order yields correct
+// nesting. Leaves carry the color-channel keys (category / age_bucket /
+// ext_slot) the host maps to its palette.
 typedef struct DsTmRect {
+  // Node id this rect represents (for selection / hit-test).
   uint64_t node;
   float x;
   float y;
   float w;
   float h;
+  // Nesting level relative to the layout root (root = 0).
   uint16_t depth;
+  // Nonzero: a directory (group) rect rather than a leaf.
   uint8_t is_dir;
+  // Kind bucket; see `ds_category_name`.
   uint8_t category;
+  // 0 this week .. 4 older (vs scan start).
   uint8_t age_bucket;
+  // 0..11 top-12 extension slot, 12 = other/none.
   uint8_t ext_slot;
 } DsTmRect;
 
@@ -141,7 +186,10 @@ int32_t ds_last_error(char *buf, size_t cap);
 
 // Start scanning `root_utf8`. Returns NULL on error (see `ds_last_error`).
 // `options` may be NULL for defaults. The callback (nullable) fires on
-// engine threads (CORE-FFI-2).
+// engine threads (CORE-FFI-2), throttled to roughly 10 Hz plus a final
+// done call; `user` is passed back verbatim on every invocation. The
+// returned handle must be released with `ds_scan_free`. Returns
+// immediately; the scan proceeds on background threads.
 struct DsScan *ds_scan_begin(const char *root_utf8,
                              const struct DsScanOptions *options,
                              void (*callback)(uint64_t items,
@@ -151,30 +199,42 @@ struct DsScan *ds_scan_begin(const char *root_utf8,
                                               void *user),
                              void *user);
 
-// Request cancellation (CORE-SCAN-11). Partial results remain valid.
+// Request cancellation (CORE-SCAN-11). Non-blocking; partial results
+// remain valid and internally consistent. NULL is a safe no-op.
 void ds_scan_cancel(struct DsScan *scan);
 
+// 1 once the scan has finished (complete or cancelled); 0 while running
+// or for a NULL handle.
 uint8_t ds_scan_is_complete(const struct DsScan *scan);
 
-// Block until the scan finishes (`scan_await`).
+// Block until the scan finishes (`scan_await`). Combine with
+// `ds_scan_cancel` for a synchronous stop. NULL is a safe no-op.
 void ds_scan_join(struct DsScan *scan);
 
 // Get a model handle. Safe to call while the scan runs (progressive reads);
-// each returned handle must be freed with `ds_model_free`.
+// each returned handle must be freed with `ds_model_free`. The model is
+// reference-counted internally, so it remains valid after `ds_scan_free`.
 struct DsModel *ds_scan_model(const struct DsScan *scan);
 
 // Free the scan handle. Cancels and joins if still running (the model, if
-// retained via `ds_scan_model`, stays valid).
+// retained via `ds_scan_model`, stays valid). No progress callback fires
+// after this returns. NULL is a safe no-op; do not double-free.
 void ds_scan_free(struct DsScan *scan);
 
-// Free a model handle (CORE-FFI-3). NodeIds from it are invalid after.
+// Free a model handle (CORE-FFI-3). NodeIds from it are invalid after
+// the LAST handle to the same model is freed. NULL is a safe no-op.
 void ds_model_free(struct DsModel *model);
 
 // Root node id (always 1 for a non-empty model; 0 = empty/invalid).
 uint64_t ds_model_root(const struct DsModel *model);
 
+// Fill `out` with live scan totals. 0 on success, -1 on NULL arguments.
+// Lock-free counter reads: cheap enough to poll from a UI timer while
+// the scan runs.
 int32_t ds_model_stats(const struct DsModel *model, struct DsScanStats *out);
 
+// Fill `out` with a node's facts. 0 on success; -1 on NULL arguments or
+// an invalid node id (details via `ds_last_error`).
 int32_t ds_node_info(const struct DsModel *model, uint64_t id, struct DsNodeInfo *out);
 
 // Node display name. Two-call pattern; returns needed bytes incl. NUL,
@@ -184,9 +244,11 @@ int32_t ds_node_name(const struct DsModel *model, uint64_t id, char *buf, size_t
 // Absolute filesystem path of a node. Two-call pattern.
 int32_t ds_node_path(const struct DsModel *model, uint64_t id, char *buf, size_t cap);
 
-// Sorted children (CORE-TREE-3). `sort`: 0 size, 1 name, 2 items, 3 mtime.
-// Fills up to `cap` ids into `buf`; returns the total child count
-// (call again with a bigger buffer if total > cap), negative on error.
+// Sorted children (CORE-TREE-3). `sort`: 0 size, 1 name, 2 items,
+// 3 mtime, 4 physical size; nonzero `descending` reverses. Fills up to
+// `cap` ids into `buf` (`buf` may be NULL to just count); returns the
+// total child count (call again with a bigger buffer if total > cap),
+// negative on error.
 int64_t ds_node_children(const struct DsModel *model,
                          uint64_t id,
                          uint8_t sort,
@@ -194,35 +256,55 @@ int64_t ds_node_children(const struct DsModel *model,
                          uint64_t *buf,
                          size_t cap);
 
+// Percent of the root's logical bytes (CORE-TREE-5). 0.0 on any error
+// (percentages are display sugar; there is no error channel here).
 double ds_node_percent_of_root(const struct DsModel *model, uint64_t id);
 
+// Percent of the parent's logical bytes (CORE-TREE-5); the root reports
+// 100. 0.0 on any error.
 double ds_node_percent_of_parent(const struct DsModel *model, uint64_t id);
 
-// Extension aggregation sorted bytes-desc (CORE-EXT-2). Fills up to `cap`
-// entries; returns total distinct extensions, negative on error.
+// Extension aggregation sorted bytes-desc (CORE-EXT-2), name-asc ties.
+// Fills up to `cap` entries (`buf` may be NULL to just count); returns
+// the total number of distinct extensions, negative on error.
 int64_t ds_type_list(const struct DsModel *model, struct DsTypeStat *buf, size_t cap);
 
 // Per-category totals over the whole tree (design 1b legend chips / 1g).
-// `buf` should hold 8 entries; returns the count written (8), sorted
-// bytes-desc.
+// `buf` should hold 8 entries; returns the category count (8), sorted
+// physical-bytes-desc. Every category is present, including zero rows.
+// Aggregates non-directory nodes only (dir totals would double-count)
+// and skips hard-link duplicates, so category totals reconcile with the
+// tree's byte totals.
 int64_t ds_category_list(const struct DsModel *model, struct DsCategoryStat *buf, size_t cap);
 
 // Stable English name for a category id (hosts localize their own).
+// Two-call pattern; unknown ids report as "Other".
 int32_t ds_category_name(uint8_t category, char *buf, size_t cap);
 
+// Supply volume capacity/free figures (CORE-SYN-2); the engine cannot
+// portably learn them itself but owns the `<Unknown>` reconciliation
+// math. 0 on success, -1 on NULL model.
 int32_t ds_model_set_volume(const struct DsModel *model, uint64_t total, uint64_t free);
 
+// Read back volume figures plus the computed `unknown` bytes (CORE-SYN-3).
+// -1 (with error detail) if `ds_model_set_volume` was never called.
 int32_t ds_model_volume(const struct DsModel *model, struct DsVolumeInfo *out);
 
-// Error message + path for report entry `index`. Two-call pattern.
+// Error message + path for report entry `index` (0-based; the count comes
+// from `DsScanStats.error_count`), formatted as "path: message".
+// Two-call pattern; -1 for NULL model or out-of-range index.
 int32_t ds_model_error(const struct DsModel *model, uint64_t index, char *buf, size_t cap);
 
 // Lay out the subtree under `root` into a `w × h` rectangle at origin.
-// `algorithm`: 0 KDirStat rows, 1 squarified. `metric`: 0 = area ∝
-// logical (apparent) bytes, 1 = area ∝ physical (allocated) bytes — the
-// truthful channel when sparse files, APFS clones, or cloud-placeholder
-// (dataless) files are present. On success writes an engine-owned buffer
-// to `(out, out_len)`; free with `ds_treemap_free`.
+// `algorithm`: 0 KDirStat rows, 1 squarified. `min_px`: smallest rect
+// side that is still subdivided (values <= 0 default to 2.0). `metric`:
+// 0 = area ∝ logical (apparent) bytes, 1 = area ∝ physical (allocated)
+// bytes — the truthful channel when sparse files, APFS clones, or
+// cloud-placeholder (dataless) files are present. On success (returns 0)
+// writes an engine-owned buffer to `(out, out_len)`; free with
+// `ds_treemap_free` and never with the host allocator. One bulk buffer
+// per frame — never per-rect calls (CORE-FFI-6). Deterministic: equal
+// inputs produce equal geometry (CORE-TM-6).
 int32_t ds_treemap_layout(const struct DsModel *model,
                           uint64_t root,
                           float w,
@@ -233,11 +315,15 @@ int32_t ds_treemap_layout(const struct DsModel *model,
                           struct DsTmRect **out,
                           size_t *out_len);
 
-// Free a layout buffer returned by `ds_treemap_layout`.
+// Free a layout buffer returned by `ds_treemap_layout`. Pass back the
+// exact pointer and length that call produced (the pair reconstructs the
+// original allocation). NULL is a safe no-op; do not free twice.
 void ds_treemap_free(struct DsTmRect *rects, size_t len);
 
 // Hit-test a laid-out buffer (CORE-TM-4). Returns the deepest containing
-// leaf's node id, 0 if none.
+// leaf's node id (a leaf beats any directory rect containing the same
+// point), 0 if the point is outside every rect. Pure function of the
+// buffer — the model is not consulted.
 uint64_t ds_treemap_hit_test(const struct DsTmRect *rects, size_t len, float x, float y);
 
 // Re-read one node and its subtree from disk (after the host mutated the
