@@ -35,7 +35,9 @@ use crate::treemap::{self, Algorithm, LayoutParams, LayoutRect};
 
 /// Bump on every ABI change; the Swift wrapper refuses to run against a
 /// mismatched header/library pair (CORE-FFI-SAFE-3 / APP-FFI-6).
-pub const DS_ABI_VERSION: u32 = 1;
+/// v2: `DsScanOptions` gained `skip_paths`/`skip_paths_len`;
+/// `DS_NODE_FLAG_DUPLICATE` added.
+pub const DS_ABI_VERSION: u32 = 2;
 
 thread_local! {
     static LAST_ERROR: RefCell<String> = const { RefCell::new(String::new()) };
@@ -108,6 +110,9 @@ pub const DS_NODE_FLAG_HIDDEN: u32 = 1;
 pub const DS_NODE_FLAG_HARDLINK_DUP: u32 = 2;
 pub const DS_NODE_FLAG_UNREADABLE: u32 = 4;
 pub const DS_NODE_FLAG_SCANNING: u32 = 8;
+/// Directory alias (same device+inode already scanned via another path,
+/// e.g. an APFS firmlink): listed but contributes nothing.
+pub const DS_NODE_FLAG_DUPLICATE: u32 = 16;
 
 #[cfg(test)]
 mod flag_sync {
@@ -119,6 +124,7 @@ mod flag_sync {
         assert_eq!(super::DS_NODE_FLAG_HARDLINK_DUP, flags::HARDLINK_DUP);
         assert_eq!(super::DS_NODE_FLAG_UNREADABLE, flags::UNREADABLE);
         assert_eq!(super::DS_NODE_FLAG_SCANNING, flags::SCANNING);
+        assert_eq!(super::DS_NODE_FLAG_DUPLICATE, flags::DUPLICATE);
     }
 }
 
@@ -130,6 +136,13 @@ pub struct DsScanOptions {
     pub follow_symlinks: u8,
     pub exclude_hidden: u8,
     pub max_concurrency: u32,
+    /// Optional array of `skip_paths_len` NUL-terminated UTF-8 absolute
+    /// directory paths the scan must not descend into (platform knowledge
+    /// the host supplies — e.g. `/System/Volumes/Data` when scanning `/` on
+    /// macOS so the APFS volume group is not traversed twice). May be NULL
+    /// when `skip_paths_len` is 0. Only read during `ds_scan_begin`.
+    pub skip_paths: *const *const c_char,
+    pub skip_paths_len: usize,
 }
 
 /// Flat per-node facts (CORE-FFI-4). Strings via `ds_node_name`/`ds_node_path`.
@@ -267,11 +280,23 @@ pub extern "C" fn ds_scan_begin(
             }
         };
         let opts = unsafe { options.as_ref() };
+        let skip_paths = opts
+            .filter(|o| !o.skip_paths.is_null() && o.skip_paths_len > 0)
+            .map(|o| {
+                unsafe { std::slice::from_raw_parts(o.skip_paths, o.skip_paths_len) }
+                    .iter()
+                    .filter(|p| !p.is_null())
+                    .filter_map(|&p| unsafe { CStr::from_ptr(p) }.to_str().ok())
+                    .map(std::path::PathBuf::from)
+                    .collect()
+            })
+            .unwrap_or_default();
         let scan_opts = ScanOptions {
             cross_filesystems: opts.map(|o| o.cross_filesystems != 0).unwrap_or(false),
             follow_symlinks: opts.map(|o| o.follow_symlinks != 0).unwrap_or(false),
             include_hidden: opts.map(|o| o.exclude_hidden == 0).unwrap_or(true),
             max_concurrency: opts.map(|o| o.max_concurrency as usize).unwrap_or(0),
+            skip_paths,
         };
 
         let cb_state = callback.map(|cb| Box::new(CallbackState { cb, user }));

@@ -541,3 +541,70 @@ fn evc_limit_saturating() {
     tree.propagate(NodeId::ROOT, 100, 0, 1, 0);
     assert_eq!(tree.get(NodeId::ROOT).unwrap().logical, u64::MAX);
 }
+
+/// skip_paths: host-supplied directories are not descended (the macOS
+/// APFS volume-group rule rides on this).
+#[test]
+fn skip_paths_not_descended() {
+    let fx = Fixture::new("skip");
+    fx.file("keep/a.bin", 10_000).file("skipme/big.bin", 90_000);
+    let mut s = Scan::begin(
+        &fx.root,
+        ScanOptions {
+            skip_paths: vec![fx.root.join("skipme")],
+            ..ScanOptions::default()
+        },
+        None,
+    )
+    .unwrap();
+    s.join();
+    let tree = s.model.tree.read().unwrap();
+    let root = tree.get(NodeId::ROOT).unwrap();
+    assert_eq!(root.logical, 10_000);
+    assert_eq!(root.subdirs, 1, "skipped dir is absent entirely");
+}
+
+/// Directory alias dedup: the same directory inode reachable through two
+/// paths (APFS firmlink / bind mount) is counted exactly once; the second
+/// path is a zero-contribution DUPLICATE node. Requires bind-mount
+/// privileges; skips silently where unavailable.
+#[cfg(target_os = "linux")]
+#[test]
+fn alias_directory_counted_once() {
+    let fx = Fixture::new("alias");
+    fx.file("real/data.bin", 70_000).file("other.bin", 5_000);
+    fs::create_dir_all(fx.root.join("mirror")).unwrap();
+    let status = std::process::Command::new("mount")
+        .args(["--bind"])
+        .arg(fx.root.join("real"))
+        .arg(fx.root.join("mirror"))
+        .status();
+    match status {
+        Ok(st) if st.success() => {}
+        _ => {
+            eprintln!("skipping: bind mount unavailable");
+            let _ = fs::remove_dir_all(&fx.root);
+            return;
+        }
+    }
+    // Bind mounts have the same st_dev on Linux only when the source is on
+    // the same filesystem — which it is here (both under the fixture).
+    let s = scan(&fx.root);
+    let _ = std::process::Command::new("umount")
+        .arg(fx.root.join("mirror"))
+        .status();
+    let tree = s.model.tree.read().unwrap();
+    let root = tree.get(NodeId::ROOT).unwrap();
+    assert_eq!(
+        root.logical, 75_000,
+        "aliased subtree must be counted exactly once"
+    );
+    // One of the two paths carries the DUPLICATE flag.
+    let dups = (0..tree.len())
+        .filter(|&i| {
+            tree.get(NodeId::from_index(i)).unwrap().flags & dirstat_core::tree::flags::DUPLICATE
+                != 0
+        })
+        .count();
+    assert_eq!(dups, 1);
+}

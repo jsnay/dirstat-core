@@ -53,6 +53,11 @@ pub mod flags {
     /// Sizes below this node may still be growing (set while a scan is
     /// in flight; cleared when the subtree is complete).
     pub const SCANNING: u32 = 1 << 3;
+    /// A directory whose (device, inode) was already scanned via another
+    /// path — an alias (APFS firmlink, bind mount). Shown as an entry but
+    /// contributes nothing and is not descended, so aliased trees are
+    /// counted exactly once.
+    pub const DUPLICATE: u32 = 1 << 4;
 }
 
 /// One node in the arena.
