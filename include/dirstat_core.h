@@ -19,7 +19,8 @@
 // v4: `DsScanOptions` gained `max_nodes`; `DS_NODE_FLAG_NON_UTF8` added;
 // `ds_node_path_raw` added (raw-bytes path for names the lossy string
 // path can't safely represent).
-#define DS_ABI_VERSION 4
+// v5: `ds_set_log_callback` added (host-routed engine event logging).
+#define DS_ABI_VERSION 5
 
 // Node flag bits mirrored into the C header (values asserted equal to the
 // internal `tree::flags` constants by a unit test).
@@ -50,6 +51,21 @@ typedef struct DsModel DsModel;
 // `ds_scan_begin`; destroyed by `ds_scan_free` (which cancels and joins
 // if the scan is still running).
 typedef struct DsScan DsScan;
+
+// Host log callback for engine lifecycle events (scan start/done with
+// totals and timings, refresh_node timings, node-ceiling hits,
+// cancellation). Levels: 0 debug, 1 info, 2 warn.
+//
+// Contract (the host side of the deal):
+// - `msg` is NUL-terminated UTF-8, valid ONLY for the duration of the
+//   call — copy it before returning.
+// - The callback fires on ENGINE WORKER THREADS, concurrently; it must be
+//   thread-safe and cheap (it sits inside scan bookkeeping).
+// - It must not panic, throw, or longjmp back into the engine — an unwind
+//   across this boundary is undefined behavior.
+// - Event volume is bounded: O(1) per scan plus O(1) per refresh, never
+//   per-file — safe to route straight to a file logger.
+typedef void (*DsLogCallback)(uint8_t level, const char *msg, void *user_data);
 
 // Scan options; zero-initialize for defaults.
 typedef struct DsScanOptions {
@@ -193,6 +209,12 @@ extern "C" {
 // ABI version of this library; compare with `DS_ABI_VERSION` in the header
 // you compiled against before calling anything else.
 uint32_t ds_abi_version(void);
+
+// Install (non-NULL) or remove (NULL) the process-global log callback.
+// Replaces any previous registration. `user_data` is passed through
+// untouched on every event; because events fire on worker threads, the
+// pointed-to state must itself be thread-safe.
+void ds_set_log_callback(DsLogCallback cb, void *user_data);
 
 // Retrieve (and keep) the calling thread's last error message.
 // Two-call pattern; returns bytes needed including NUL, 0 if no error.

@@ -35,7 +35,7 @@
 //!   in src/ffi.rs through the cbindgen-generated `include/dirstat_core.h`
 //!
 //! # Structure
-//! - module declarations — classify, ffi, format, scan, tree, treemap
+//! - module declarations — classify, ffi, format, log, scan, tree, treemap
 //! - `pub use` re-exports — flatten the most-used types to the crate root
 //!
 //! # Algorithm & invariants
@@ -48,6 +48,7 @@
 pub mod classify;
 pub mod ffi;
 pub mod format;
+pub mod log;
 pub mod scan;
 pub mod tree;
 pub mod treemap;

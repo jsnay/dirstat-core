@@ -8,7 +8,7 @@ usize_is_size_t = true
 
 [export]
 include = ["DS_ABI_VERSION"]
-exclude = ["HIDDEN", "HARDLINK_DUP", "UNREADABLE", "SCANNING", "DUPLICATE", "NON_UTF8", "NodeId", "CATEGORY_COUNT"]
+exclude = ["HIDDEN", "HARDLINK_DUP", "UNREADABLE", "SCANNING", "DUPLICATE", "NON_UTF8", "DEBUG", "INFO", "WARN", "NodeId", "CATEGORY_COUNT"]
 
 [export.rename]
 
