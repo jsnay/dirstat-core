@@ -330,6 +330,19 @@ impl Scan {
             options.max_concurrency
         };
 
+        if crate::log::enabled() {
+            crate::log::emit(
+                crate::log::INFO,
+                &format!(
+                    "scan start: root={} workers={} max_nodes={} skip_paths={}",
+                    root.display(),
+                    n_workers,
+                    options.max_nodes,
+                    options.skip_paths.len()
+                ),
+            );
+        }
+
         let shared = Arc::new(ScanShared {
             model: Arc::clone(&model),
             queue: WorkQueue {
@@ -377,7 +390,10 @@ impl Scan {
     /// far"). Non-blocking and idempotent — pair with [`Scan::join`] to
     /// wait for the workers to actually exit.
     pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::Relaxed);
+        // swap (not store) so repeated cancels log the request only once.
+        if !self.cancel.swap(true, Ordering::Relaxed) {
+            crate::log::emit(crate::log::INFO, "scan cancel requested");
+        }
     }
 
     /// True once every worker has finished (whether by exhausting the
@@ -573,6 +589,25 @@ fn finish_if_first(sh: &ScanShared) {
             root.flags &= !flags::SCANNING;
         }
         sh.maybe_report(Path::new(""), true);
+        if crate::log::enabled() {
+            let how = if sh.cancel.load(Ordering::Relaxed) {
+                "cancelled"
+            } else {
+                "completed"
+            };
+            crate::log::emit(
+                crate::log::INFO,
+                &format!(
+                    "scan {}: items={} bytes={} errors={} ceiling_hit={} duration_ms={}",
+                    how,
+                    sh.model.items.load(Ordering::Relaxed),
+                    sh.model.bytes.load(Ordering::Relaxed),
+                    sh.model.errors.lock().unwrap().len(),
+                    sh.node_limit_hit.load(Ordering::Relaxed),
+                    sh.started.elapsed().as_millis()
+                ),
+            );
+        }
     }
 }
 
@@ -835,6 +870,10 @@ fn process_dir(sh: &ScanShared, dir_id: NodeId, dir_path: &Path, inherited: Opti
                 sh.options.max_nodes
             ),
         });
+        crate::log::emit(
+            crate::log::WARN,
+            &format!("node ceiling reached: max_nodes={}", sh.options.max_nodes),
+        );
     }
 
     // Extension aggregation, incremental (CORE-EXT-1). Done outside the
@@ -890,6 +929,7 @@ fn process_dir(sh: &ScanShared, dir_id: NodeId, dir_path: &Path, inherited: Opti
 /// each step is write-locked so readers stay consistent, but a concurrent
 /// scan could re-add bytes between the subtract and re-add steps.
 pub fn refresh_node(model: &Arc<Model>, id: NodeId) -> std::io::Result<()> {
+    let refresh_started = std::time::Instant::now();
     // Snapshot under a read lock: path (for the re-stat), the old
     // aggregate tuple (what we must subtract), and the parent link.
     let (path, old, parent) = {
@@ -1029,6 +1069,16 @@ pub fn refresh_node(model: &Arc<Model>, id: NodeId) -> std::io::Result<()> {
                 }
             }
         }
+    }
+    if crate::log::enabled() {
+        crate::log::emit(
+            crate::log::INFO,
+            &format!(
+                "refresh done: path={} duration_ms={}",
+                path.display(),
+                refresh_started.elapsed().as_millis()
+            ),
+        );
     }
     Ok(())
 }

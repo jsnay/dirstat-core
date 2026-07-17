@@ -404,3 +404,85 @@ fn ffi_node_path_raw() {
     assert!(raw.contains(&0xff), "raw path preserves the invalid byte");
     ds_model_free(model);
 }
+
+/// ds_set_log_callback (v5): register → events arrive from a scan and a
+/// refresh; unregister → silence. The collector is a process-global
+/// static because the callback is process-global; assertions filter by
+/// this test's root path where identity matters, and the post-unregister
+/// check relies on set_sink(None) stopping ALL emission, so a concurrent
+/// test can't grow the log either.
+#[test]
+fn ffi_log_callback_events() {
+    use std::sync::Mutex;
+    static EVENTS: Mutex<Vec<(u8, String)>> = Mutex::new(Vec::new());
+
+    extern "C" fn on_log(level: u8, msg: *const c_char, _user: *mut std::ffi::c_void) {
+        let s = unsafe { std::ffi::CStr::from_ptr(msg) }
+            .to_string_lossy()
+            .into_owned();
+        EVENTS.lock().unwrap().push((level, s));
+    }
+
+    let fx = Fixture::new("log");
+    fx.file("a/x.bin", 10_000).file("b/y.bin", 20_000);
+    let root_c = CString::new(fx.root.to_str().unwrap()).unwrap();
+
+    ds_set_log_callback(Some(on_log), std::ptr::null_mut());
+
+    let scan = ds_scan_begin(
+        root_c.as_ptr(),
+        std::ptr::null(),
+        None,
+        std::ptr::null_mut(),
+    );
+    assert!(!scan.is_null());
+    ds_scan_join(scan);
+    let model = ds_scan_model(scan);
+    ds_scan_free(scan);
+
+    // A refresh also emits.
+    let root = ds_model_root(model);
+    let mut kids = [0u64; 4];
+    let n = ds_node_children(model, root, 0, 1, kids.as_mut_ptr(), 4);
+    assert!(n >= 1);
+    assert_eq!(ds_refresh_node(model, kids[0]), 0);
+
+    {
+        let events = EVENTS.lock().unwrap();
+        let mine: Vec<&(u8, String)> = events
+            .iter()
+            .filter(|(_, m)| m.contains(fx.root.to_str().unwrap()) || m.starts_with("scan "))
+            .collect();
+        assert!(
+            mine.iter().any(|(_, m)| m.starts_with("scan start:")),
+            "missing scan-start event; got {events:?}"
+        );
+        assert!(
+            mine.iter()
+                .any(|(_, m)| m.starts_with("scan completed:") && m.contains("items=")),
+            "missing scan-done totals; got {events:?}"
+        );
+        assert!(
+            mine.iter().any(|(_, m)| m.starts_with("refresh done:")),
+            "missing refresh event; got {events:?}"
+        );
+    }
+
+    // Unregister: nothing emits any more, from any thread or test.
+    ds_set_log_callback(None, std::ptr::null_mut());
+    let len_after = EVENTS.lock().unwrap().len();
+    let scan2 = ds_scan_begin(
+        root_c.as_ptr(),
+        std::ptr::null(),
+        None,
+        std::ptr::null_mut(),
+    );
+    ds_scan_join(scan2);
+    ds_scan_free(scan2);
+    assert_eq!(
+        EVENTS.lock().unwrap().len(),
+        len_after,
+        "events arrived after unregister"
+    );
+    ds_model_free(model);
+}

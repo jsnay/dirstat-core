@@ -117,7 +117,8 @@ use crate::treemap::{self, Algorithm, LayoutParams, LayoutRect};
 /// v4: `DsScanOptions` gained `max_nodes`; `DS_NODE_FLAG_NON_UTF8` added;
 /// `ds_node_path_raw` added (raw-bytes path for names the lossy string
 /// path can't safely represent).
-pub const DS_ABI_VERSION: u32 = 4;
+/// v5: `ds_set_log_callback` added (host-routed engine event logging).
+pub const DS_ABI_VERSION: u32 = 5;
 
 thread_local! {
     // Per-thread last-error text (empty = no error). Thread-local so
@@ -427,6 +428,46 @@ pub struct DsScanStats {
 #[no_mangle]
 pub extern "C" fn ds_abi_version() -> u32 {
     DS_ABI_VERSION
+}
+
+/// Host log callback for engine lifecycle events (scan start/done with
+/// totals and timings, refresh_node timings, node-ceiling hits,
+/// cancellation). Levels: 0 debug, 1 info, 2 warn.
+///
+/// Contract (the host side of the deal):
+/// - `msg` is NUL-terminated UTF-8, valid ONLY for the duration of the
+///   call — copy it before returning.
+/// - The callback fires on ENGINE WORKER THREADS, concurrently; it must be
+///   thread-safe and cheap (it sits inside scan bookkeeping).
+/// - It must not panic, throw, or longjmp back into the engine — an unwind
+///   across this boundary is undefined behavior.
+/// - Event volume is bounded: O(1) per scan plus O(1) per refresh, never
+///   per-file — safe to route straight to a file logger.
+pub type DsLogCallback =
+    Option<extern "C" fn(level: u8, msg: *const c_char, user_data: *mut c_void)>;
+
+/// Install (non-NULL) or remove (NULL) the process-global log callback.
+/// Replaces any previous registration. `user_data` is passed through
+/// untouched on every event; because events fire on worker threads, the
+/// pointed-to state must itself be thread-safe.
+#[no_mangle]
+pub extern "C" fn ds_set_log_callback(cb: DsLogCallback, user_data: *mut c_void) {
+    guard((), || match cb {
+        Some(f) => {
+            // Erase the raw pointer to usize so the closure is Send + Sync;
+            // the header documents that the host's user_data must be safe
+            // to touch from any thread.
+            let user = user_data as usize;
+            crate::log::set_sink(Some(Box::new(move |level, msg| {
+                // Engine messages never contain interior NULs, but the
+                // CString round-trip enforces it rather than trusting it.
+                if let Ok(c) = std::ffi::CString::new(msg) {
+                    f(level, c.as_ptr(), user as *mut c_void);
+                }
+            })));
+        }
+        None => crate::log::set_sink(None),
+    })
 }
 
 /// Retrieve (and keep) the calling thread's last error message.

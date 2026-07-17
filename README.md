@@ -111,6 +111,8 @@ Rules (documented per-function in the header):
 | 1 | Initial surface: scan lifecycle, tree access, extension/category aggregation, treemap layout + hit test, volume reconciliation, refresh. |
 | 2 | `DsScanOptions.skip_paths`; `DS_NODE_FLAG_DUPLICATE` (directory-alias dedup). |
 | 3 | `ds_treemap_layout` `metric` parameter; sort key 4 (physical); `DsCategoryStat.physical`. |
+| 4 | `DsScanOptions.max_nodes` (directory-bomb ceiling); `DS_NODE_FLAG_NON_UTF8`; `ds_node_path_raw`. |
+| 5 | `ds_set_log_callback` — host-routed engine event logging (scan/refresh lifecycle, timings, ceiling hits; bounded volume, worker-thread delivery). The engine never writes files; the host owns log destination and retention. |
 
 Hosts check `ds_abi_version()` at startup; MacDirStat additionally diffs the
 pinned header at build time. Regenerate after any `src/ffi.rs` change
